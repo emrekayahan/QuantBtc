@@ -1,0 +1,38 @@
+# Environment & Secrets (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Migration Bundles & Archives
+*.tar.gz
+*.tgz
+*.zip
+*.bak
+
+# Local Agent / IDE Config
+.gemini/
+.vscode/
+.idea/
+
+# Python & Virtual Environments
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime Databases & Logs
+*.db
+*.db.wal
+*.db-shm
+*.db-wal
+quant-bot-live/data/
+quant-bot-live/logs/
+data/
+logs/

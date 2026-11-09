@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Autonomous Quant Engine v3.0 — Live LAN Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    body { background-color: #0b0f19; color: #e2e8f0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+    .card { background-color: #111827; border: 1px solid #1f2937; border-radius: 0.75rem; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+  </style>
+</head>
+<body class="min-h-screen p-4 md:p-6">
+  <!-- Auth / Alert Banner -->
+  <div id="authBanner" class="hidden mb-4 p-4 rounded-lg bg-red-900/80 border border-red-500 text-red-100 font-semibold flex items-center justify-between">
+    <span id="authBannerText">CRITICAL ALERT: Binance Authentication Error detected!</span>
+  </div>
+
+  <!-- Top Header + Armed Kill Switch -->
+  <header class="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4 mb-6">
+    <div>
+      <div class="flex items-center gap-3">
+        <h1 class="text-2xl font-bold tracking-tight text-white">AUTONOMOUS QUANT ENGINE <span class="text-xs px-2 py-0.5 rounded bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 mono">v3.0 LIVE</span></h1>
+        <span id="statusBadge" class="px-3 py-1 rounded-full text-xs font-bold tracking-wider uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">ACTIVE</span>
+        <span id="regimeBadge" class="px-3 py-1 rounded-full text-xs font-bold tracking-wider uppercase bg-blue-500/20 text-blue-300 border border-blue-500/40">MEAN_REVERTING</span>
+      </div>
+      <p id="macroCommentary" class="text-xs text-slate-400 mt-1">Initializing deterministic state & macro scanner...</p>
+    </div>
+
+    <div class="flex items-center gap-3">
+      <button id="resumeBtn" onclick="resumeSystem()" class="hidden px-4 py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm transition">
+        RESUME SYSTEM
+      </button>
+      <button id="killSwitchBtn" onclick="triggerKillSwitch()" class="px-5 py-2.5 rounded-lg bg-red-600 hover:bg-red-500 active:bg-red-700 text-white font-extrabold text-sm tracking-wide shadow-lg shadow-red-900/50 border border-red-400 transition flex items-center gap-2">
+        <span>⚠️ PANIC STOP / FLATTEN ALL</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Top KPI Bar -->
+  <section class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
+    <div class="card p-4">
+      <div class="text-xs text-slate-400 uppercase">Total USDT Equity</div>
+      <div id="kpiEquity" class="text-xl font-bold text-white mono mt-1">$0.00</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-xs text-slate-400 uppercase">Free USDT</div>
+      <div id="kpiFreeUsdt" class="text-xl font-bold text-emerald-400 mono mt-1">$0.00</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-xs text-slate-400 uppercase">Daily Realized PnL</div>
+      <div id="kpiDailyPnl" class="text-xl font-bold text-white mono mt-1">$0.00 (0.00%)</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-xs text-slate-400 uppercase">Current Drawdown</div>
+      <div id="kpiDrawdown" class="text-xl font-bold text-amber-400 mono mt-1">0.00%</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-xs text-slate-400 uppercase">Min Confidence / Max Pos</div>
+      <div id="kpiGates" class="text-lg font-bold text-indigo-300 mono mt-1">80% / $25.00</div>
+    </div>
+    <div class="card p-4">
+      <div class="text-xs text-slate-400 uppercase">Clock Drift (NTP)</div>
+      <div id="kpiClock" class="text-xl font-bold text-slate-200 mono mt-1">0 ms</div>
+    </div>
+  </section>
+
+  <!-- Main Grid: Interactive Chart + Open Positions -->
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+    <!-- Left 2 Cols: TradingView Lightweight Chart -->
+    <div class="card p-4 lg:col-span-2 flex flex-col">
+      <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+        <div class="flex items-center gap-3">
+          <h2 class="text-sm font-bold uppercase tracking-wider text-slate-300">15m Causal Price Chart & Server-Side SL Lines</h2>
+          <select id="symbolSelect" onchange="onSymbolChange()" class="bg-slate-800 border border-slate-700 text-white text-sm rounded px-3 py-1 mono">
+            <option value="BTC/USDT">BTC/USDT</option>
+            <option value="ETH/USDT">ETH/USDT</option>
+            <option value="SOL/USDT">SOL/USDT</option>
+          </select>
+        </div>
+        <div class="flex items-center gap-4 text-xs text-slate-400">
+          <span class="flex items-center gap-1"><span class="w-3 h-0.5 bg-amber-400 inline-block"></span> EMA(200)</span>
+          <span class="flex items-center gap-1"><span class="w-3 h-0.5 bg-emerald-400 inline-block"></span> Take-Profit</span>
+          <span class="flex items-center gap-1"><span class="w-3 h-0.5 bg-red-500 inline-block"></span> Server-Side SL</span>
+        </div>
+      </div>
+      <div id="tvChart" class="w-full h-96 rounded overflow-hidden bg-slate-950"></div>
+    </div>
+
+    <!-- Right Col: OpenRouter Multi-Key Pool & Overnight Brier Telemetry -->
+    <div class="card p-4 flex flex-col justify-between gap-4">
+      <div>
+        <h2 class="text-sm font-bold uppercase tracking-wider text-slate-300 mb-3">OpenRouter Multi-Key Pool (3-Key Rotator)</h2>
+        <div id="openrouterKeysContainer" class="space-y-2 text-xs">
+          <div class="text-slate-400">Loading OpenRouter key pool telemetry...</div>
+        </div>
+      </div>
+
+      <div class="border-t border-slate-800 pt-4">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="text-sm font-bold uppercase tracking-wider text-slate-300">Overnight Brier Calibration</h2>
+          <span id="brierScoreBadge" class="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-xs mono font-bold">BS: 0.0000</span>
+        </div>
+        <div id="brierMeta" class="text-xs text-slate-400 mb-2">Last Audit: Pending 00:05 UTC</div>
+        <pre id="brierNotes" class="text-xs bg-slate-950 p-3 rounded border border-slate-800 text-slate-300 whitespace-pre-wrap max-h-44 overflow-y-auto mono">No overnight audit recorded yet.</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- Open Positions & Server-Side Orders Table -->
+  <section class="card p-4 mb-6">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-sm font-bold uppercase tracking-wider text-slate-300">Open Positions & Mandatory Server-Side Stop-Loss Orders</h2>
+      <span id="openPosCount" class="text-xs text-slate-400 mono">0 / 3 Open</span>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full text-left text-sm">
+        <thead class="text-xs uppercase text-slate-400 border-b border-slate-800">
+          <tr>
+            <th class="py-2 px-3">Symbol</th>
+            <th class="py-2 px-3">Qty</th>
+            <th class="py-2 px-3">Entry Price</th>
+            <th class="py-2 px-3">Current Price</th>
+            <th class="py-2 px-3">Unrealized PnL</th>
+            <th class="py-2 px-3">Server-Side SL ID</th>
+            <th class="py-2 px-3">SL Stop Price</th>
+            <th class="py-2 px-3">Take-Profit</th>
+            <th class="py-2 px-3 text-right">Action</th>
+          </tr>
+        </thead>
+        <tbody id="openPositionsBody" class="divide-y divide-slate-800/60 mono text-xs">
+          <tr><td colspan="9" class="py-4 text-center text-slate-500">No open positions.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Autonomous Scanner Watchlist Table (Top 20 Liquid USDT Pairs) -->
+  <section class="card p-4">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-sm font-bold uppercase tracking-wider text-slate-300">Autonomous Market Scanner — Top 20 Liquid USDT Pairs ($50M+ Vol, ≤0.15% Spread)</h2>
+      <span id="watchlistCount" class="text-xs text-slate-400 mono">0 Pairs</span>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full text-left text-sm">
+        <thead class="text-xs uppercase text-slate-400 border-b border-slate-800">
+          <tr>
+            <th class="py-2 px-3">#</th>
+            <th class="py-2 px-3">Symbol</th>
+            <th class="py-2 px-3">Price</th>
+            <th class="py-2 px-3">24h Vol ($M)</th>
+            <th class="py-2 px-3">Spread (bps)</th>
+            <th class="py-2 px-3">RSI(14)</th>
+            <th class="py-2 px-3">Setup Quality</th>
+            <th class="py-2 px-3">Confidence</th>
+            <th class="py-2 px-3">Toxic Flow</th>
+          </tr>
+        </thead>
+        <tbody id="watchlistBody" class="divide-y divide-slate-800/60 mono text-xs">
+          <tr><td colspan="9" class="py-4 text-center text-slate-500">Waiting for scanner cycle...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <script>
+    let chart = null;
+    let candleSeries = null;
+    let ema200Series = null;
+    let priceLines = [];
+    let currentSymbol = "BTC/USDT";
+
+    function initChart() {
+      const container = document.getElementById("tvChart");
+      chart = LightweightCharts.createChart(container, {
+        layout: { background: { type: "solid", color: "#020617" }, textColor: "#94a3b8" },
+        grid: { vertLines: { color: "#0f172a" }, horzLines: { color: "#0f172a" } },
+        timeScale: { timeVisible: true, secondsVisible: false },
+        rightPriceScale: { borderColor: "#1e293b" },
+      });
+      candleSeries = chart.addCandlestickSeries({
+        upColor: "#10b981", downColor: "#ef4444", borderVisible: false,
+        wickUpColor: "#10b981", wickDownColor: "#ef4444"
+      });
+      ema200Series = chart.addLineSeries({
+        color: "#fbbf24", lineWidth: 2, title: "EMA 200"
+      });
+      window.addEventListener("resize", () => {
+        chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+      });
+    }
+
+    async function loadChart(symbol) {
+      try {
+        const res = await fetch(`/api/chart?symbol=${encodeURIComponent(symbol)}`);
+        const data = await res.json();
+        if (!chart) initChart();
+
+        if (data.candles && data.candles.length > 0) {
+          candleSeries.setData(data.candles);
+        }
+        if (data.ema200 && data.ema200.length > 0) {
+          ema200Series.setData(data.ema200);
+        }
+
+        priceLines.forEach(line => candleSeries.removePriceLine(line));
+        priceLines = [];
+
+        if (data.positions && data.positions.length > 0) {
+          data.positions.forEach(pos => {
+            priceLines.push(candleSeries.createPriceLine({
+              price: Number(pos.entry_price),
+              color: "#3b82f6",
+              lineWidth: 2,
+              lineStyle: LightweightCharts.LineStyle.Solid,
+              axisLabelVisible: true,
+              title: "ENTRY",
+            }));
+            priceLines.push(candleSeries.createPriceLine({
+              price: Number(pos.invalidation_price),
+              color: "#ef4444",
+              lineWidth: 2,
+              lineStyle: LightweightCharts.LineStyle.Dashed,
+              axisLabelVisible: true,
+              title: "SERVER SL",
+            }));
+            priceLines.push(candleSeries.createPriceLine({
+              price: Number(pos.take_profit_price),
+              color: "#10b981",
+              lineWidth: 2,
+              lineStyle: LightweightCharts.LineStyle.Dashed,
+              axisLabelVisible: true,
+              title: "TAKE PROFIT",
+            }));
+          });
+        }
+      } catch (err) {
+        console.error("Failed to load chart:", err);
+      }
+    }
+
+    function onSymbolChange() {
+      const sel = document.getElementById("symbolSelect");
+      currentSymbol = sel.value;
+      loadChart(currentSymbol);
+    }
+
+    async function fetchTelemetry() {
+      try {
+        const res = await fetch("/api/telemetry");
+        const data = await res.json();
+        const k = data.kpis;
+
+        document.getElementById("kpiEquity").textContent = `$${Number(k.total_equity_usd).toFixed(2)}`;
+        document.getElementById("kpiFreeUsdt").textContent = `$${Number(k.free_usdt).toFixed(2)}`;
+
+        const pnlEl = document.getElementById("kpiDailyPnl");
+        const pnlVal = Number(k.daily_realized_pnl_usd);
+        pnlEl.textContent = `${pnlVal >= 0 ? "+" : ""}$${pnlVal.toFixed(2)} (${Number(k.daily_realized_pnl_pct).toFixed(2)}%)`;
+        pnlEl.className = `text-xl font-bold mono mt-1 ${pnlVal >= 0 ? "text-emerald-400" : "text-red-400"}`;
+
+        document.getElementById("kpiDrawdown").textContent = `${Number(k.current_drawdown_pct).toFixed(2)}%`;
+        document.getElementById("kpiGates").textContent = `${(Number(k.min_confidence_threshold) * 100).toFixed(0)}% / $${Number(k.max_position_usd).toFixed(2)}`;
+        document.getElementById("kpiClock").textContent = `${k.clock_drift_ms} ms`;
+
+        const statusBadge = document.getElementById("statusBadge");
+        const resumeBtn = document.getElementById("resumeBtn");
+        if (k.system_status === "HALTED") {
+          statusBadge.textContent = "HALTED";
+          statusBadge.className = "px-3 py-1 rounded-full text-xs font-bold tracking-wider uppercase bg-red-500/20 text-red-400 border border-red-500/40";
+          resumeBtn.classList.remove("hidden");
+        } else {
+          statusBadge.textContent = "ACTIVE";
+          statusBadge.className = "px-3 py-1 rounded-full text-xs font-bold tracking-wider uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/40";
+          resumeBtn.classList.add("hidden");
+        }
+
+        const regimeBadge = document.getElementById("regimeBadge");
+        regimeBadge.textContent = k.macro_regime;
+        if (k.macro_regime === "CRISIS") {
+          regimeBadge.className = "px-3 py-1 rounded-full text-xs font-bold tracking-wider uppercase bg-red-600/30 text-red-300 border border-red-500";
+        } else if (k.macro_regime === "TRENDING") {
+          regimeBadge.className = "px-3 py-1 rounded-full text-xs font-bold tracking-wider uppercase bg-emerald-600/30 text-emerald-300 border border-emerald-500";
+        } else {
+          regimeBadge.className = "px-3 py-1 rounded-full text-xs font-bold tracking-wider uppercase bg-blue-600/30 text-blue-300 border border-blue-500";
+        }
+
+        document.getElementById("macroCommentary").textContent = k.macro_commentary || "Deterministic baseline active.";
+
+        const authBanner = document.getElementById("authBanner");
+        if (k.auth_error_banner) {
+          authBanner.classList.remove("hidden");
+          document.getElementById("authBannerText").textContent = k.auth_error_banner;
+        } else {
+          authBanner.classList.add("hidden");
+        }
+
+        // OpenRouter keys
+        const orContainer = document.getElementById("openrouterKeysContainer");
+        const keys = (data.openrouter && data.openrouter.keys) || [];
+        if (keys.length === 0) {
+          orContainer.innerHTML = `<div class="p-2 rounded bg-slate-900 border border-slate-800 text-slate-400">Deterministic Math Mode Active (0 OpenRouter keys configured)</div>`;
+        } else {
+          orContainer.innerHTML = keys.map((item, idx) => {
+            const color = item.status === "healthy" ? "text-emerald-400" : "text-amber-400";
+            return `<div class="p-2 rounded bg-slate-900 border border-slate-800 flex items-center justify-between">
+              <span class="mono">Key #${idx + 1} (${item.masked_key})</span>
+              <span class="${color} font-bold uppercase">${item.status} (Req:${item.requests} / 429:${item.rate_limits})</span>
+            </div>`;
+          }).join("");
+        }
+
+        // Brier telemetry
+        if (data.brier) {
+          document.getElementById("brierScoreBadge").textContent = `BS: ${Number(data.brier.brier_score).toFixed(4)}`;
+          document.getElementById("brierMeta").textContent = `Review Date: ${data.brier.review_date} | Resolved Samples: ${data.brier.sample_count}`;
+          document.getElementById("brierNotes").textContent = data.brier.notes || "";
+        }
+
+        // Open positions table
+        const posBody = document.getElementById("openPositionsBody");
+        const positions = data.open_positions || [];
+        document.getElementById("openPosCount").textContent = `${positions.length} / 3 Open`;
+        if (positions.length === 0) {
+          posBody.innerHTML = `<tr><td colspan="9" class="py-4 text-center text-slate-500">No open positions.</td></tr>`;
+        } else {
+          posBody.innerHTML = positions.map(p => {
+            const upnl = Number(p.unrealized_pnl_usd);
+            const upnlClass = upnl >= 0 ? "text-emerald-400" : "text-red-400";
+            return `<tr>
+              <td class="py-2 px-3 font-bold text-white">${p.symbol}</td>
+              <td class="py-2 px-3">${Number(p.quantity).toFixed(5)}</td>
+              <td class="py-2 px-3">$${Number(p.entry_price).toFixed(4)}</td>
+              <td class="py-2 px-3">$${Number(p.current_price).toFixed(4)}</td>
+              <td class="py-2 px-3 font-bold ${upnlClass}">${upnl >= 0 ? "+" : ""}$${upnl.toFixed(2)}</td>
+              <td class="py-2 px-3 text-indigo-300">${p.sl_exchange_order_id || p.sl_client_order_id || "ACTIVE"}</td>
+              <td class="py-2 px-3 text-red-400 font-semibold">$${Number(p.invalidation_price).toFixed(4)}</td>
+              <td class="py-2 px-3 text-emerald-400">$${Number(p.take_profit_price).toFixed(4)}</td>
+              <td class="py-2 px-3 text-right">
+                <button onclick="closeSinglePosition('${p.position_id}')" class="px-2.5 py-1 rounded bg-red-600/80 hover:bg-red-500 text-white font-bold text-xs">
+                  Close Position (Market)
+                </button>
+              </td>
+            </tr>`;
+          }).join("");
+        }
+
+        // Watchlist table & dropdown sync
+        const wl = data.watchlist || [];
+        document.getElementById("watchlistCount").textContent = `${wl.length} Pairs`;
+        const wlBody = document.getElementById("watchlistBody");
+        const sel = document.getElementById("symbolSelect");
+        if (wl.length > 0) {
+          const existingOptions = Array.from(sel.options).map(o => o.value);
+          wl.forEach(item => {
+            if (!existingOptions.includes(item.symbol)) {
+              const opt = document.createElement("option");
+              opt.value = item.symbol;
+              opt.textContent = item.symbol;
+              sel.appendChild(opt);
+            }
+          });
+
+          wlBody.innerHTML = wl.map(w => {
+            const qBadge = w.setup_quality >= 2 ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40" : "bg-slate-800 text-slate-400 border-slate-700";
+            return `<tr class="hover:bg-slate-800/40 cursor-pointer" onclick="selectWatchlistSymbol('${w.symbol}')">
+              <td class="py-2 px-3 text-slate-400">${w.rank}</td>
+              <td class="py-2 px-3 font-bold text-white">${w.symbol}</td>
+              <td class="py-2 px-3">$${Number(w.price).toFixed(4)}</td>
+              <td class="py-2 px-3">$${(Number(w.volume_24h_usd) / 1e6).toFixed(1)}M</td>
+              <td class="py-2 px-3">${Number(w.spread_bps).toFixed(2)}</td>
+              <td class="py-2 px-3">${Number(w.rsi_14).toFixed(1)}</td>
+              <td class="py-2 px-3"><span class="px-2 py-0.5 rounded border text-xs ${qBadge}">${w.setup_quality} / 3</span></td>
+              <td class="py-2 px-3">${(Number(w.direction_confidence) * 100).toFixed(1)}%</td>
+              <td class="py-2 px-3 ${w.toxic_flow === 'none' ? 'text-slate-400' : 'text-amber-400 font-bold'}">${w.toxic_flow}</td>
+            </tr>`;
+          }).join("");
+        }
+      } catch (err) {
+        console.error("Telemetry poll error:", err);
+      }
+    }
+
+    function selectWatchlistSymbol(sym) {
+      const sel = document.getElementById("symbolSelect");
+      sel.value = sym;
+      currentSymbol = sym;
+      loadChart(sym);
+    }
+
+    async function triggerKillSwitch() {
+      if (!confirm("CRITICAL CONFIRMATION: Cancel all open Binance orders, market-sell all open positions, and HALT the engine?")) {
+        return;
+      }
+      await fetch("/api/kill-switch", { method: "POST" });
+      await fetchTelemetry();
+    }
+
+    async function resumeSystem() {
+      await fetch("/api/resume", { method: "POST" });
+      await fetchTelemetry();
+    }
+
+    async function closeSinglePosition(positionId) {
+      if (!confirm(`Market-sell and close position ${positionId} immediately?`)) return;
+      await fetch(`/api/positions/${encodeURIComponent(positionId)}/close`, { method: "POST" });
+      await fetchTelemetry();
+      await loadChart(currentSymbol);
+    }
+
+    window.addEventListener("DOMContentLoaded", () => {
+      initChart();
+      fetchTelemetry();
+      loadChart(currentSymbol);
+      setInterval(fetchTelemetry, 4000);
+      setInterval(() => loadChart(currentSymbol), 15000);
+    });
+  </script>
+</body>
+</html>

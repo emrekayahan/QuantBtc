@@ -1,0 +1,19 @@
+[Unit]
+Description=Autonomous Quantitative Trading Engine v3.0 & Protected Web Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<YOUR_LINUX_USER>
+Group=<YOUR_LINUX_USER>
+WorkingDirectory=/home/<YOUR_LINUX_USER>/btc/quant-bot-live
+EnvironmentFile=/home/<YOUR_LINUX_USER>/btc/quant-bot-live/.env
+ExecStart=/home/<YOUR_LINUX_USER>/btc/quant-bot-live/.venv/bin/python /home/<YOUR_LINUX_USER>/btc/quant-bot-live/main.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/<YOUR_LINUX_USER>/btc/quant-bot-live/logs/systemd.log
+StandardError=append:/home/<YOUR_LINUX_USER>/btc/quant-bot-live/logs/systemd.log
+
+[Install]
+WantedBy=multi-user.target
