@@ -19,6 +19,11 @@ _PLACEHOLDER_VALUES = {
 }
 
 
+def _clean_md(text: str) -> str:
+    """Remove characters that can break legacy Telegram Markdown entity parsing."""
+    return str(text or "").replace("_", "-").replace("*", "").replace("`", "'").replace("[", "(").replace("]", ")")
+
+
 class TelegramNotifier:
     """Non-blocking Telegram notifier and two-way command polling client."""
 
@@ -50,23 +55,61 @@ class TelegramNotifier:
             self._client = httpx.AsyncClient(timeout=10.0)
         return self._client
 
+    async def register_commands_menu(self) -> None:
+        """Register clickable command menu in Telegram client UI."""
+        if not self.enabled:
+            return
+        try:
+            client = await self._get_client()
+            await client.post(
+                f"{self.base_url}/setMyCommands",
+                json={
+                    "commands": [
+                        {"command": "durum", "description": "Kasa bakiyesi, rejim ve sistem özeti"},
+                        {"command": "liste", "description": "İzleme listesi, RSI ve güven puanları"},
+                        {"command": "pozisyonlar", "description": "Açık işlem ve emirler"},
+                        {"command": "audit", "description": "Son 24 saatlik Brier kalibrasyonu"},
+                        {"command": "panic", "description": "Acil Durum: Her şeyi kapat ve kilitle"},
+                        {"command": "baslat", "description": "Durdurulmuş sistemi tekrar aktif et"},
+                        {"command": "yardim", "description": "Komut listesini göster"},
+                    ]
+                },
+            )
+        except Exception as exc:
+            logger.debug("Could not register Telegram command menu: %s", exc)
+
     async def send_message(self, text: str, parse_mode: str = "Markdown") -> bool:
-        """Send notification message to configured chat_id safely without raising."""
+        """Send notification message to configured chat_id safely, falling back to plain text on HTTP 400."""
         if not self.enabled:
             return False
         try:
             client = await self._get_client()
-            resp = await client.post(
-                f"{self.base_url}/sendMessage",
-                json={
-                    "chat_id": self.chat_id,
-                    "text": text,
-                    "parse_mode": parse_mode,
-                    "disable_web_page_preview": True,
-                },
-            )
+            payload: dict[str, Any] = {
+                "chat_id": self.chat_id,
+                "text": text,
+                "disable_web_page_preview": True,
+            }
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+
+            resp = await client.post(f"{self.base_url}/sendMessage", json=payload)
             if resp.status_code == 200:
                 return True
+
+            # Fallback to plain text if Markdown entity parsing fails (HTTP 400)
+            if resp.status_code == 400 and parse_mode:
+                plain_text = text.replace("*", "").replace("`", "").replace("_", "")
+                resp_fallback = await client.post(
+                    f"{self.base_url}/sendMessage",
+                    json={
+                        "chat_id": self.chat_id,
+                        "text": plain_text,
+                        "disable_web_page_preview": True,
+                    },
+                )
+                if resp_fallback.status_code == 200:
+                    return True
+
             logger.warning("Telegram sendMessage returned %d: %s", resp.status_code, resp.text)
         except Exception as exc:
             logger.warning("Telegram notification failed (ignored): %s", exc)
@@ -123,7 +166,7 @@ class TelegramNotifier:
 
     async def notify_system_event(self, title: str, details: str, is_warning: bool = False) -> None:
         icon = "⚠️" if is_warning else "ℹ️"
-        msg = f"{icon} *{title.upper()}*\n\n{details}"
+        msg = f"{icon} *{_clean_md(title).upper()}*\n\n{details}"
         await self.send_message(msg)
 
     # === TWO-WAY TELEGRAM COMMAND HANDLER ===
@@ -131,6 +174,7 @@ class TelegramNotifier:
         """Start background polling task for incoming commands from operator."""
         if not self.enabled or self._running:
             return
+        await self.register_commands_menu()
         self._running = True
         self._poll_task = asyncio.create_task(self._poll_loop(), name="telegram_poll_loop")
         logger.info("Telegram command polling loop started.")
@@ -183,7 +227,7 @@ class TelegramNotifier:
     async def _handle_command(self, raw_cmd: str) -> None:
         cmd = raw_cmd.split()[0].split("@")[0].lower()
 
-        if cmd in ("/start", "/help", "/yardim"):
+        if cmd in ("/start", "/help", "/yardim", "/yardım"):
             msg = (
                 "🤖 *QuantBot Live v3.0 Komut Listesi*\n\n"
                 "• `/durum` veya `/status` — Kasa bakiyesi, rejim ve sistem özeti\n"
@@ -195,7 +239,7 @@ class TelegramNotifier:
             )
             await self.send_message(msg)
 
-        elif cmd in ("/durum", "/status"):
+        elif cmd in ("/durum", "/status", "/ozet", "/özet"):
             if not self.db:
                 await self.send_message("❌ Veritabanı bağlantısı henüz hazır değil.")
                 return
@@ -204,7 +248,8 @@ class TelegramNotifier:
             free = float(state.get("free_usdt", "0.0") or 0.0)
             pnl = float(state.get("daily_realized_pnl_usd", "0.0") or 0.0)
             dd = float(state.get("current_drawdown_pct", "0.0") or 0.0)
-            regime = state.get("macro_regime", "Bilinmiyor").upper()
+            regime = _clean_md(state.get("macro_regime", "Bilinmiyor").upper())
+            commentary = _clean_md(state.get("macro_commentary", "Veri yok"))[:240]
             halted = state.get("system_halted", "false").lower() in ("true", "1")
             status_badge = "🔴 DURDURULDU (HALTED)" if halted else "🟢 AKTİF (ÇALIŞIYOR)"
 
@@ -217,7 +262,7 @@ class TelegramNotifier:
                 f"• *Drawdown:* `%{dd:.2f}`\n"
                 f"• *Piyasa Rejimi:* `{regime}`\n"
                 f"• *Saat Farkı:* `{state.get('clock_drift_ms', '0')} ms`\n"
-                f"• *Makro Yorum:* _{state.get('macro_commentary', 'Veri yok')[:200]}..._"
+                f"• *Makro Yorum:* {commentary}"
             )
             await self.send_message(msg)
 
@@ -236,7 +281,7 @@ class TelegramNotifier:
                 )
             await self.send_message("\n".join(lines))
 
-        elif cmd in ("/pozisyonlar", "/pos"):
+        elif cmd in ("/pozisyonlar", "/pozsyonlar", "/pozisyon", "/pos", "/positions"):
             if not self.db:
                 await self.send_message("❌ Veritabanı bağlantısı henüz hazır değil.")
                 return
@@ -261,7 +306,7 @@ class TelegramNotifier:
                 return
             msg = (
                 f"🌙 *Son 24s Brier Kalibrasyon Özeti*\n\n"
-                f"• *Tarih:* `{latest.get('review_date')}`\n"
+                f"• *Tarih:* `{_clean_md(latest.get('review_date'))}`\n"
                 f"• *Brier Skoru:* `{latest.get('brier_score', 0):.4f}`\n"
                 f"• *İşlem Sayısı:* `{latest.get('sample_count', 0)}`\n"
                 f"• *Min Güven Eşiği:* `%{latest.get('min_confidence_threshold', 0.8)*100:.0f}`\n"
@@ -285,9 +330,15 @@ class TelegramNotifier:
                 f"• Sistem Durumu: `HALTED (KİLİTLİ)`"
             )
 
-        elif cmd in ("/baslat", "/resume"):
+        elif cmd in ("/baslat", "/başlat", "/resume"):
             if self.db:
                 self.db.set_system_halted(False, reason="Telegram /resume komutu")
                 await self.send_message("✅ *Sistem tekrar aktif edildi.* Otonom tarama ve reflex döngüsü devam ediyor.")
             else:
                 await self.send_message("❌ Veritabanına erişilemedi.")
+
+        else:
+            await self.send_message(
+                f"❓ Bilinmeyen komut: `{_clean_md(cmd)}`\n"
+                f"Kullanılabilir komutlar: `/durum`, `/liste`, `/pozisyonlar`, `/audit`, `/panic`, `/baslat`"
+            )
