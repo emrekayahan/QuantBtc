@@ -117,7 +117,6 @@ class AutonomousQuantEngineOrchestrator:
         try:
             await self.exchange.ensure_markets_loaded()
             await self.scanner.run_scan_cycle()
-            await self.evaluate_watchlist_reflex_cycle()
         except Exception as exc:
             logger.error("Initial market scan failed (will retry on schedule): %s", exc)
 

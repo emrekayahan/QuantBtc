@@ -58,18 +58,18 @@ class PreTradeAnalyzer:
                 bids = ob.get("bids") or []
                 asks = ob.get("asks") or []
                 if bids and asks:
-                    bid_vol_5 = sum(float(b[1]) for b in bids[:5] if len(b) >= 2)
-                    ask_vol_5 = sum(float(a[1]) for a in asks[:5] if len(a) >= 2)
-                    total_5 = bid_vol_5 + ask_vol_5
-                    if total_5 > 0:
-                        ob_imbalance = (bid_vol_5 - ask_vol_5) / total_5
-                    if bid_vol_5 > 0:
-                        sell_wall_ratio = ask_vol_5 / bid_vol_5
+                    bid_vol_15 = sum(float(b[1]) for b in bids[:15] if len(b) >= 2)
+                    ask_vol_15 = sum(float(a[1]) for a in asks[:15] if len(a) >= 2)
+                    total_15 = bid_vol_15 + ask_vol_15
+                    if total_15 > 0:
+                        ob_imbalance = (bid_vol_15 - ask_vol_15) / total_15
+                    if bid_vol_15 > 0:
+                        sell_wall_ratio = ask_vol_15 / bid_vol_15
             except Exception as exc:
                 logger.debug("PreTradeAnalyzer live orderbook check skipped: %s", exc)
 
-        # (a) Reject if there is a massive sell wall directly above entry
-        if ob_imbalance < -0.30 or sell_wall_ratio > 3.2:
+        # (a) Reject if there is an extreme sell wall directly above entry
+        if ob_imbalance < -0.68 or sell_wall_ratio > 5.5:
             reason = (
                 f"Massive sell wall detected above entry on {decision.symbol} "
                 f"(OB Imbalance={ob_imbalance:+.2f}, Ask/Bid Ratio={sell_wall_ratio:.2f}x)"

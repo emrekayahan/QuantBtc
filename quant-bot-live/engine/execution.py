@@ -168,7 +168,9 @@ class ExecutionEngine:
 
         raw_qty = position_usd / max(decision.entry_price, 1e-9)
         qty = self.exchange.amount_to_precision(decision.symbol, raw_qty)
-        entry_price_fmt = self.exchange.price_to_precision(decision.symbol, decision.entry_price)
+        is_live_ccxt = getattr(self.exchange.client, "urls", None) is not None
+        limit_buy_price = decision.entry_price * 1.0015 if is_live_ccxt else decision.entry_price
+        entry_price_fmt = self.exchange.price_to_precision(decision.symbol, limit_buy_price)
 
         if qty <= 0.0:
             return {
@@ -196,7 +198,7 @@ class ExecutionEngine:
                         side="buy",
                         amount=qty,
                         price=entry_price_fmt,
-                        params={"newClientOrderId": entry_client_id},
+                        params={"newClientOrderId": entry_client_id, "timeInForce": "GTC"},
                     )
                 except Exception as fut_exc:
                     logger.warning(
@@ -208,10 +210,15 @@ class ExecutionEngine:
                         use_futures_client = False
                         trading_mode = "SPOT"
                         leverage = 1
-                        position_usd = max(11.50, min(float(free_usdt) * 0.38, 25.0))
+                        position_usd = 11.50
                         qty = self.exchange.amount_to_precision(
                             decision.symbol, position_usd / max(decision.entry_price, 1e-9)
                         )
+                        entry_client_id = f"{entry_client_id}_S"
+                        if pre_trade_msg:
+                            pre_trade_msg = pre_trade_msg.replace("FUTURES 2x ISOLATED", "SPOT").replace(
+                                "FUTURES 3x ISOLATED", "SPOT"
+                            )
                         entry_order = await self._place_order_idempotently(
                             symbol=decision.symbol,
                             order_type="limit",
