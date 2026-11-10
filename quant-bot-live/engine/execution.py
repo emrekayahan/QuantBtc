@@ -145,6 +145,7 @@ class ExecutionEngine:
         trading_mode = str(gate.get("trading_mode", trading_mode))
 
         # Step 3: Pre-Trade Deep Analysis Gate (Orderbook Imbalance + Mistake Learner + 3-bullet Telegram summary)
+        pre_trade_msg: Optional[str] = None
         if self.pre_trade_analyzer is not None:
             pre_check = await self.pre_trade_analyzer.analyze_before_execution(
                 decision=decision,
@@ -152,6 +153,7 @@ class ExecutionEngine:
                 position_usd=position_usd,
                 leverage=leverage,
                 min_confidence=self.risk_engine.get_active_min_confidence(),
+                send_telegram=False,
             )
             if not pre_check.get("approved", True):
                 self.db.save_reflex_decision(decision.model_dump(), executed=False)
@@ -160,6 +162,7 @@ class ExecutionEngine:
                     "reason": pre_check.get("reason", "Pre-Trade Gate rejected"),
                     "decision": decision.model_dump(),
                 }
+            pre_trade_msg = pre_check.get("telegram_message")
 
         raw_qty = position_usd / max(decision.entry_price, 1e-9)
         qty = self.exchange.amount_to_precision(decision.symbol, raw_qty)
@@ -180,27 +183,76 @@ class ExecutionEngine:
             trading_mode == "FUTURES"
             and getattr(self.exchange, "futures_client", None) is not None
         )
-        if use_futures_client:
-            await self.exchange.configure_futures_isolated(decision.symbol, leverage=leverage)
-            entry_order = await self.exchange.create_futures_order(
-                symbol=decision.symbol,
-                order_type="limit",
-                side="buy",
-                amount=qty,
-                price=entry_price_fmt,
-                params={"newClientOrderId": entry_client_id},
-            )
-        else:
-            # Place Spot entry order idempotently
-            entry_order = await self._place_order_idempotently(
-                symbol=decision.symbol,
-                order_type="limit",
-                side="buy",
-                amount=qty,
-                price=entry_price_fmt,
-                client_order_id=entry_client_id,
-                max_attempts=3,
-            )
+        entry_order: Optional[Dict[str, Any]] = None
+        try:
+            if use_futures_client:
+                try:
+                    await self.exchange.configure_futures_isolated(decision.symbol, leverage=leverage)
+                    entry_order = await self.exchange.create_futures_order(
+                        symbol=decision.symbol,
+                        order_type="limit",
+                        side="buy",
+                        amount=qty,
+                        price=entry_price_fmt,
+                        params={"newClientOrderId": entry_client_id},
+                    )
+                except Exception as fut_exc:
+                    logger.warning(
+                        "Futures order failed on %s (%s); checking Spot fallback...",
+                        decision.symbol,
+                        fut_exc,
+                    )
+                    if float(free_usdt) >= 11.50:
+                        use_futures_client = False
+                        trading_mode = "SPOT"
+                        leverage = 1
+                        position_usd = max(11.50, min(float(free_usdt) * 0.38, 25.0))
+                        qty = self.exchange.amount_to_precision(
+                            decision.symbol, position_usd / max(decision.entry_price, 1e-9)
+                        )
+                        entry_order = await self._place_order_idempotently(
+                            symbol=decision.symbol,
+                            order_type="limit",
+                            side="buy",
+                            amount=qty,
+                            price=entry_price_fmt,
+                            client_order_id=entry_client_id,
+                            max_attempts=2,
+                        )
+                    else:
+                        raise fut_exc
+            else:
+                # Place Spot entry order idempotently
+                entry_order = await self._place_order_idempotently(
+                    symbol=decision.symbol,
+                    order_type="limit",
+                    side="buy",
+                    amount=qty,
+                    price=entry_price_fmt,
+                    client_order_id=entry_client_id,
+                    max_attempts=3,
+                )
+        except Exception as order_exc:
+            err_str = str(order_exc)
+            if "-2015" in err_str or "permissions for action" in err_str:
+                now_s = int(time.time())
+                last_alert_s = int(self.db.get_state("last_perm_alert_s", "0") or 0)
+                if self.telegram is not None and (now_s - last_alert_s) >= 1800:
+                    self.db.set_state("last_perm_alert_s", str(now_s))
+                    await self.telegram.send_message(
+                        "⚠️ *BINANCE API İZİN HATASI (-2015)*\n\n"
+                        f"`{decision.symbol}` için giriş sinyali yakalandı ancak Binance emri reddetti:\n"
+                        "`Invalid API-key, IP, or permissions for action (-2015)`\n\n"
+                        "🔧 *Çözüm (1 Dakika):*\n"
+                        "1. Binance -> **API Management** sayfasına girin.\n"
+                        "2. **Edit restrictions**'a tıklayın.\n"
+                        "3. **Restrict access to trusted IPs only** seçeneğini işaretleyip sunucu IP'miz olan **`34.17.158.26`** adresini ekleyin.\n"
+                        "4. **Enable Spot & Margin Trading** ve **Enable Futures** kutucuklarını işaretleyip **Save** yapın."
+                    )
+            raise
+
+        if pre_trade_msg and self.telegram is not None:
+            await self.telegram.send_message(pre_trade_msg)
 
         exchange_order_id = str(entry_order.get("id") or entry_order.get("exchange_order_id") or "")
         filled_qty = float(entry_order.get("filled") or entry_order.get("amount") or qty)

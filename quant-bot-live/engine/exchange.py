@@ -242,24 +242,49 @@ class BinanceExchangeWrapper:
             "active_mode": active_mode,
         }
 
+    async def ensure_futures_markets_loaded(self, reload: bool = False) -> Dict[str, Any]:
+        """Load USD-M Futures markets using public exchangeInfo without triggering private SAPI calls."""
+        if self.futures_client is None or not hasattr(self.futures_client, "load_markets"):
+            self._futures_markets_loaded = True
+            return getattr(self.futures_client, "markets", None) or {}
+        if not self._futures_markets_loaded or reload:
+            saved_key = getattr(self.futures_client, "apiKey", None)
+            saved_secret = getattr(self.futures_client, "secret", None)
+            try:
+                if hasattr(self.futures_client, "apiKey"):
+                    self.futures_client.apiKey = ""
+                    self.futures_client.secret = ""
+                await self._with_backoff(lambda: self.futures_client.load_markets(reload))
+                self._futures_markets_loaded = True
+            finally:
+                if saved_key is not None:
+                    self.futures_client.apiKey = saved_key
+                if saved_secret is not None:
+                    self.futures_client.secret = saved_secret
+        return self.futures_client.markets or {}
+
+    def resolve_futures_symbol(self, symbol: str) -> str:
+        """Map standard 'SOL/USDT' symbol to CCXT linear perpetual symbol 'SOL/USDT:USDT' if present."""
+        if self.futures_client is not None and self.futures_client.markets:
+            perp_sym = f"{symbol}:USDT" if ":" not in symbol else symbol
+            if perp_sym in self.futures_client.markets:
+                return perp_sym
+        return symbol
+
     async def configure_futures_isolated(self, symbol: str, leverage: int = 2) -> None:
         """Configure 2x-3x ISOLATED margin mode for a USD-M Futures symbol."""
         if self.futures_client is None:
             return
-        if not self._futures_markets_loaded:
-            try:
-                await self.futures_client.load_markets()
-                self._futures_markets_loaded = True
-            except Exception as exc:
-                logger.debug("Futures load_markets warning: %s", exc)
+        await self.ensure_futures_markets_loaded()
+        fut_symbol = self.resolve_futures_symbol(symbol)
         try:
-            await self.futures_client.set_margin_mode("ISOLATED", symbol)
+            await self.futures_client.set_margin_mode("ISOLATED", fut_symbol)
         except Exception as exc:
-            logger.debug("Futures set_margin_mode(ISOLATED, %s) info: %s", symbol, exc)
+            logger.debug("Futures set_margin_mode(ISOLATED, %s) info: %s", fut_symbol, exc)
         try:
-            await self.futures_client.set_leverage(int(leverage), symbol)
+            await self.futures_client.set_leverage(int(leverage), fut_symbol)
         except Exception as exc:
-            logger.debug("Futures set_leverage(%d, %s) info: %s", leverage, symbol, exc)
+            logger.debug("Futures set_leverage(%d, %s) info: %s", leverage, fut_symbol, exc)
 
     async def create_futures_order(
         self,
@@ -273,9 +298,8 @@ class BinanceExchangeWrapper:
         """Place an order on USD-M Futures when FUTURES mode is active."""
         if self.futures_client is None:
             raise RuntimeError("Futures client is not initialized")
-        if not self._futures_markets_loaded:
-            await self.futures_client.load_markets()
-            self._futures_markets_loaded = True
+        await self.ensure_futures_markets_loaded()
+        fut_symbol = self.resolve_futures_symbol(symbol)
         fmt_amount = self.amount_to_precision(symbol, amount)
         fmt_price = self.price_to_precision(symbol, price) if price is not None else None
         extra_params = dict(params or {})
@@ -284,7 +308,7 @@ class BinanceExchangeWrapper:
                 symbol, float(extra_params["stopPrice"])
             )
         return await self.futures_client.create_order(
-            symbol, order_type, side, fmt_amount, fmt_price, extra_params
+            fut_symbol, order_type, side, fmt_amount, fmt_price, extra_params
         )
 
     async def fetch_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:

@@ -39,6 +39,7 @@ class PreTradeAnalyzer:
         position_usd: float = 11.50,
         leverage: int = 1,
         min_confidence: float = 0.68,
+        send_telegram: bool = True,
     ) -> Dict[str, Any]:
         """
         1. Check Orderbook Imbalance & top-of-book sell wall directly above entry.
@@ -144,12 +145,12 @@ class PreTradeAnalyzer:
             except Exception as exc:
                 logger.debug("PreTradeAnalyzer LLM summary fallback used: %s", exc)
 
-        if self.telegram is not None:
-            msg = (
-                f"🔍 *İŞLEM ÖNCESİ DERİN ANALİZ ({mode_label})*\n\n"
-                f"{summary_text}"
-            )
-            await self.telegram.send_message(msg)
+        telegram_msg = (
+            f"🔍 *İŞLEM ÖNCESİ DERİN ANALİZ ({mode_label})*\n\n"
+            f"{summary_text}"
+        )
+        if self.telegram is not None and send_telegram:
+            await self.telegram.send_message(telegram_msg)
 
         return {
             "approved": True,
@@ -157,4 +158,5 @@ class PreTradeAnalyzer:
             "effective_confidence": effective_confidence,
             "orderbook_imbalance": ob_imbalance,
             "summary": summary_text,
+            "telegram_message": telegram_msg,
         }
