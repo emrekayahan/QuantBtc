@@ -123,14 +123,16 @@ class ExecutionEngine:
             futures_free_usdt = float(self.db.get_state("futures_free_usdt", "0.0") or 0.0)
 
         futures_min = float(getattr(self.cfg, "FUTURES_MIN_USDT", 5.0))
-        trading_mode = "FUTURES" if float(futures_free_usdt) >= futures_min else "SPOT"
+        futures_api_ok = self.db.get_state("futures_api_enabled", "true") != "false"
+        effective_futures_usdt = float(futures_free_usdt) if futures_api_ok else 0.0
+        trading_mode = "FUTURES" if effective_futures_usdt >= futures_min else "SPOT"
 
         gate = self.risk_engine.evaluate_gate(
             decision=decision,
             free_usdt=free_usdt,
             min_notional_usd=min_notional,
             trading_mode=trading_mode,
-            futures_free_usdt=float(futures_free_usdt),
+            futures_free_usdt=effective_futures_usdt,
         )
         if not gate["approved"]:
             self.db.save_reflex_decision(decision.model_dump(), executed=False)

@@ -226,13 +226,27 @@ class BinanceExchangeWrapper:
         fut_free = float(fut_bal.get("free", 0.0))
         fut_total = float(fut_bal.get("total", 0.0))
 
+        # Check API key trading permissions (cached for 60s) so we only activate FUTURES if enableFutures is True
+        now_s = int(time.time())
+        last_perm_check = getattr(self, "_last_perm_check_s", 0)
+        enable_futures_perm = getattr(self, "_enable_futures_perm", True)
+        if (now_s - last_perm_check) >= 60 and hasattr(self.client, "sapi_get_account_apirestrictions"):
+            try:
+                restr = await self.client.sapi_get_account_apirestrictions()
+                enable_futures_perm = bool(restr.get("enableFutures", False))
+                self._enable_futures_perm = enable_futures_perm
+                self._last_perm_check_s = now_s
+            except Exception as exc:
+                logger.debug("Could not query API restrictions: %s", exc)
+
         futures_min = float(getattr(self.cfg, "FUTURES_MIN_USDT", 5.0))
-        active_mode = "FUTURES" if fut_free >= futures_min else "SPOT"
+        active_mode = "FUTURES" if (fut_free >= futures_min and enable_futures_perm) else "SPOT"
 
         if self.db is not None:
             self.db.set_state("spot_free_usdt", f"{spot_free:.2f}")
             self.db.set_state("futures_free_usdt", f"{fut_free:.2f}")
             self.db.set_state("active_trading_mode", active_mode)
+            self.db.set_state("futures_api_enabled", "true" if enable_futures_perm else "false")
 
         return {
             "spot_free_usdt": spot_free,
