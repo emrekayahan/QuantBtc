@@ -66,7 +66,7 @@ class OvernightBrierReviewer:
             samples.append((conf, outcome))
 
         sample_count = len(samples)
-        brier_score = self.compute_brier_score(samples) if sample_count > 0 else 0.12
+        brier_score = self.compute_brier_score(samples) if sample_count > 0 else None
 
         current_min_conf = float(
             self.db.get_state("min_confidence_threshold", str(self.cfg.MIN_CONFIDENCE_THRESHOLD))
@@ -77,7 +77,15 @@ class OvernightBrierReviewer:
             or self.cfg.MAX_POSITION_USD
         )
 
-        if sample_count > 0 and brier_score > 0.25:
+        if sample_count == 0:
+            new_min_conf = current_min_conf
+            new_max_pos = current_max_pos
+            calibration_action = (
+                "Insufficient sample size (N=0 resolved trades in 24h): "
+                f"Retaining active parameters MIN_CONFIDENCE_THRESHOLD={current_min_conf:.2f}, "
+                f"MAX_POSITION_USD=${current_max_pos:.2f}. Brier calibration skipped."
+            )
+        elif brier_score is not None and brier_score > 0.25:
             new_min_conf = min(0.90, round(current_min_conf + 0.03, 4))
             new_max_pos = round(max(11.5, current_max_pos * 0.80), 2)
             calibration_action = (
@@ -89,19 +97,21 @@ class OvernightBrierReviewer:
             # Gradually restore toward baseline defaults when well-calibrated
             new_min_conf = float(self.cfg.MIN_CONFIDENCE_THRESHOLD)
             new_max_pos = float(self.cfg.MAX_POSITION_USD)
+            bs_str = f"{brier_score:.4f}" if brier_score is not None else "N/A"
             calibration_action = (
-                f"Well-calibrated Brier Score ({brier_score:.4f} <= 0.25): "
+                f"Well-calibrated Brier Score ({bs_str} <= 0.25): "
                 f"Maintained baseline MIN_CONFIDENCE_THRESHOLD={new_min_conf:.2f}, "
                 f"MAX_POSITION_USD=${new_max_pos:.2f}."
             )
 
         today_str = dt.datetime.now(dt.timezone.utc).strftime("%Y_%m_%d")
+        bs_display = f"`{brier_score:.4f}`" if brier_score is not None else "`N/A (insufficient samples)`"
         deterministic_md = (
             f"# Overnight Quantitative Audit ({today_str})\n\n"
             f"- **Sample Count (24h Resolved Trades):** {sample_count}\n"
             f"- **Win Rate:** {(wins / sample_count * 100.0) if sample_count else 0.0:.1f}%\n"
             f"- **24h Realized PnL:** ${total_pnl:.2f}\n"
-            f"- **Brier Score:** `{brier_score:.4f}`\n"
+            f"- **Brier Score:** {bs_display}\n"
             f"- **Self-Tuning Action:** {calibration_action}\n"
         )
 
@@ -120,7 +130,7 @@ class OvernightBrierReviewer:
         self.db.save_brier_calibration(
             review_date=today_str,
             sample_count=sample_count,
-            brier_score=brier_score,
+            brier_score=float(brier_score) if brier_score is not None else 0.0,
             min_confidence_threshold=new_min_conf,
             max_position_usd=new_max_pos,
             notes=notes,
