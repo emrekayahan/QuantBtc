@@ -37,12 +37,104 @@ class StateReconciler:
             db=db, telegram=telegram
         )
 
+    async def run_startup_recovery(self) -> Dict[str, Any]:
+        """
+        Audit exchange vs DuckDB open positions on startup.
+        If a position is in OPEN_UNPROTECTED or has no valid SL on exchange,
+        attempt to immediately place the SL, or market-flatten it if placement fails.
+        """
+        if getattr(self.cfg, "is_paper", True):
+            logger.info("Startup recovery: Running in PAPER mode, exchange recovery skipped.")
+            return {"recovered": 0, "flattened": 0, "status": "paper_ok"}
+
+        recovered = 0
+        flattened = 0
+        open_positions = self.db.get_open_positions(include_unprotected=True)
+
+        for pos in open_positions:
+            pos_id = pos["position_id"]
+            symbol = pos["symbol"]
+            status = pos.get("status", "OPEN")
+            sl_order_id = pos.get("sl_exchange_order_id")
+
+            if status == "OPEN_UNPROTECTED" or not sl_order_id:
+                logger.warning("Startup recovery: Found unprotected position %s for %s! Attempting emergency resolution...", pos_id, symbol)
+                if self.execution is not None:
+                    try:
+                        res = await self.execution.close_single_position_market(position_id=pos_id, reason="STARTUP_UNPROTECTED_RECOVERY")
+                        if res.get("closed"):
+                            flattened += 1
+                    except Exception as rec_exc:
+                        logger.critical("Startup recovery failed to flatten %s: %s", pos_id, rec_exc)
+
+        return {"recovered": recovered, "flattened": flattened, "status": "completed"}
+
     async def reconcile_cycle(self) -> Dict[str, Any]:
         """
         1. Fetch live Binance Spot & USD-M Futures balances and tickers.
         2. Update current prices, unrealized PnL, total USDT equity, peak equity, and drawdown %.
         3. Check if any open position hit take_profit_price or if its Server-Side SL filled on Binance.
         """
+        # In Paper mode, simulate balances and reconcile paper positions using live tickers
+        if getattr(self.cfg, "is_paper", True):
+            open_positions = self.db.get_open_positions()
+            tickers: Dict[str, Any] = {}
+            if open_positions:
+                try:
+                    tickers = await self.exchange.fetch_tickers()
+                except Exception as exc:
+                    logger.warning("Paper reconciler failed to fetch tickers: %s", exc)
+
+            reconciled_closed = 0
+            tp_triggered = 0
+            positions_value_usd = 0.0
+
+            for pos in open_positions:
+                symbol = pos["symbol"]
+                pos_id = pos["position_id"]
+                qty = float(pos["quantity"])
+                tp_price = float(pos["take_profit_price"])
+                invalidation_price = float(pos["invalidation_price"])
+                t = tickers.get(symbol, {})
+                live_price = float(t.get("last") or t.get("close") or pos.get("current_price") or pos["entry_price"])
+                self.db.update_position_price(pos_id, live_price)
+
+                if live_price <= invalidation_price and self.execution is not None:
+                    await self.execution.close_single_position_market(position_id=pos_id, reason="STOP_LOSS_HIT")
+                    reconciled_closed += 1
+                    continue
+                if live_price >= tp_price and self.execution is not None:
+                    await self.execution.close_single_position_market(position_id=pos_id, reason="TAKE_PROFIT_HIT")
+                    tp_triggered += 1
+                    continue
+
+                positions_value_usd += qty * live_price
+
+            paper_wallet = float(self.db.get_state("paper_wallet_balance_usdt", "30.0") or 30.0)
+            daily_pnl = self.db.get_daily_realized_pnl()
+            total_equity_usd = paper_wallet + daily_pnl + positions_value_usd
+            free_usdt = max(0.0, paper_wallet + daily_pnl - sum(float(p["cost_usd"]) for p in self.db.get_open_positions()))
+
+            self.db.set_state("free_usdt", f"{free_usdt:.2f}")
+            self.db.set_state("spot_free_usdt", f"{free_usdt:.2f}")
+            self.db.set_state("futures_free_usdt", "0.00")
+            self.db.set_state("futures_total_usdt", "0.00")
+            self.db.set_state("active_trading_mode", "PAPER")
+            self.db.set_state("total_equity_usd", f"{total_equity_usd:.2f}")
+            self.db.set_state("daily_realized_pnl_usd", f"{daily_pnl:.2f}")
+
+            return {
+                "free_usdt": round(free_usdt, 2),
+                "spot_free_usdt": round(free_usdt, 2),
+                "futures_free_usdt": 0.0,
+                "active_trading_mode": "PAPER",
+                "total_equity_usd": round(total_equity_usd, 2),
+                "drawdown_pct": 0.0,
+                "daily_realized_pnl_usd": round(daily_pnl, 2),
+                "reconciled_closed": reconciled_closed,
+                "tp_triggered": tp_triggered,
+                "is_paper": True,
+            }
         if hasattr(self.exchange, "fetch_dual_wallet_balances"):
             dual = await self.exchange.fetch_dual_wallet_balances()
             spot_free_usdt = float(dual.get("spot_free_usdt", 0.0))

@@ -110,6 +110,7 @@ class AutonomousQuantEngineOrchestrator:
 
         if self.cfg_has_keys():
             try:
+                await self.reconciler.run_startup_recovery()
                 await self.reconciler.reconcile_cycle()
             except Exception as exc:
                 logger.warning("Initial balance/position reconciliation warning: %s", exc)

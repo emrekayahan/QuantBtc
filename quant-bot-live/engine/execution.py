@@ -380,18 +380,30 @@ class ExecutionEngine:
         filled_qty = float(raw_filled) if (raw_filled is not None and is_live_ccxt) else float(raw_filled or entry_order.get("amount") or qty)
         order_status = str(entry_order.get("status") or "closed").lower()
 
-        if is_live_ccxt and (filled_qty <= 0.0 or order_status == "open"):
-            await asyncio.sleep(1.5)
-            refreshed = (
-                await self.exchange.fetch_futures_order(exchange_order_id, decision.symbol)
-                if use_futures_client and hasattr(self.exchange, "fetch_futures_order")
-                else await self.exchange.fetch_order(exchange_order_id, decision.symbol)
-            )
-            if refreshed:
-                entry_order = refreshed
-                filled_qty = float(entry_order.get("filled") or 0.0)
-                order_status = str(entry_order.get("status") or order_status).lower()
+        # === T1: ENTRY TTL & POLL LOOP ===
+        ttl_sec = float(getattr(self.cfg, "ENTRY_ORDER_TTL_SEC", 90.0))
+        poll_interval_sec = float(getattr(self.cfg, "ENTRY_ORDER_POLL_SEC", 2.0))
 
+        if is_live_ccxt and (filled_qty < qty or order_status == "open"):
+            start_poll_time = time.time()
+            while time.time() - start_poll_time < ttl_sec:
+                await asyncio.sleep(poll_interval_sec)
+                try:
+                    refreshed = (
+                        await self.exchange.fetch_futures_order(exchange_order_id, decision.symbol)
+                        if use_futures_client and hasattr(self.exchange, "fetch_futures_order")
+                        else await self.exchange.fetch_order(exchange_order_id, decision.symbol)
+                    )
+                    if refreshed:
+                        entry_order = refreshed
+                        filled_qty = float(entry_order.get("filled") or 0.0)
+                        order_status = str(entry_order.get("status") or order_status).lower()
+                        if order_status in ("closed", "canceled", "rejected", "expired") or filled_qty >= qty:
+                            break
+                except Exception as poll_exc:
+                    logger.debug("Transient error polling entry order %s: %s", exchange_order_id, poll_exc)
+
+            # If still open after TTL or early exit, cancel the remaining unfilled balance
             if order_status == "open":
                 try:
                     if use_futures_client and getattr(self.exchange, "futures_client", None) is not None:
@@ -402,6 +414,20 @@ class ExecutionEngine:
                     order_status = "canceled" if filled_qty <= 0.0 else "closed"
                 except Exception as cancel_exc:
                     logger.warning("Could not cancel remaining open entry order %s: %s", exchange_order_id, cancel_exc)
+
+                # Final refresh after cancellation to get exact filled quantity
+                try:
+                    final_check = (
+                        await self.exchange.fetch_futures_order(exchange_order_id, decision.symbol)
+                        if use_futures_client and hasattr(self.exchange, "fetch_futures_order")
+                        else await self.exchange.fetch_order(exchange_order_id, decision.symbol)
+                    )
+                    if final_check:
+                        entry_order = final_check
+                        filled_qty = float(entry_order.get("filled") or filled_qty)
+                        order_status = str(entry_order.get("status") or order_status).lower()
+                except Exception as final_exc:
+                    logger.debug("Could not run final fetch for order %s: %s", exchange_order_id, final_exc)
 
             if filled_qty <= 0.0:
                 self.db.upsert_order(
@@ -422,7 +448,7 @@ class ExecutionEngine:
                 )
                 return {
                     "executed": False,
-                    "reason": f"Limit buy order {exchange_order_id} did not fill immediately and was canceled.",
+                    "reason": f"Limit buy order {exchange_order_id} expired after TTL ({ttl_sec}s) with 0 fill and was canceled.",
                 }
 
         fill_price = float(
@@ -527,31 +553,73 @@ class ExecutionEngine:
                     await asyncio.sleep(0.1)
 
         if sl_order is None:
-            # EMERGENCY FLATTEN RULE: Immediately market-sell unprotected position and pause symbol for 4h
+            # EMERGENCY FLATTEN RULE: Mark position as OPEN_UNPROTECTED first so state reconciler knows it's exposed
+            unprot_pos_id = f"POS_{decision.symbol.replace('/', '')}_{decision.causal_timestamp_ms}"
+            self.db.open_position(
+                {
+                    "position_id": unprot_pos_id,
+                    "symbol": decision.symbol,
+                    "status": "OPEN_UNPROTECTED",
+                    "entry_client_order_id": entry_client_id,
+                    "entry_exchange_order_id": exchange_order_id,
+                    "sl_client_order_id": None,
+                    "sl_exchange_order_id": None,
+                    "entry_price": fill_price,
+                    "current_price": fill_price,
+                    "invalidation_price": stop_price,
+                    "take_profit_price": decision.take_profit_price,
+                    "quantity": sl_qty,
+                    "cost_usd": cost_usd,
+                    "direction_confidence": decision.direction_confidence,
+                    "setup_quality": decision.setup_quality,
+                    "regime": decision.regime,
+                    "opened_at_ms": int(time.time() * 1000),
+                    "market_type": trading_mode.lower(),
+                    "leverage": leverage,
+                    "margin_usd": round(cost_usd / max(leverage, 1), 4) if use_futures_client else cost_usd,
+                    "notional_usd": cost_usd,
+                    "sl_slippage_pct": 0.0,
+                    "is_paper": False,
+                }
+            )
+
             logger.critical(
                 "CRITICAL: Server-Side Stop-Loss failed after 3 attempts on %s (%s). "
                 "Executing immediate market sell to eliminate unprotected exposure!",
                 decision.symbol,
                 sl_error,
             )
-            if use_futures_client:
-                emergency_sell = await self.exchange.create_futures_order(
-                    symbol=decision.symbol,
-                    order_type="market",
-                    side="sell",
-                    amount=sl_qty,
-                    price=None,
-                    params={"reduceOnly": True},
+            emergency_sell = None
+            try:
+                if use_futures_client:
+                    emergency_sell = await self.exchange.create_futures_order(
+                        symbol=decision.symbol,
+                        order_type="market",
+                        side="sell",
+                        amount=sl_qty,
+                        price=None,
+                        params={"reduceOnly": True},
+                    )
+                else:
+                    emergency_sell = await self.exchange.create_market_sell_order(decision.symbol, sl_qty)
+                
+                # If market sell succeeded, close the position cleanly
+                exit_price = float((emergency_sell or {}).get("average") or (emergency_sell or {}).get("price") or fill_price)
+                self.db.close_position(
+                    position_id=unprot_pos_id,
+                    exit_price=exit_price,
+                    close_reason="EMERGENCY_FLATTEN_SL_PLACEMENT_FAILED",
                 )
-            else:
-                emergency_sell = await self.exchange.create_market_sell_order(decision.symbol, sl_qty)
+            except Exception as em_exc:
+                logger.critical("EMERGENCY FLATTEN SELL FAILED on %s: %s! Position remains in OPEN_UNPROTECTED status!", decision.symbol, em_exc)
+
             self.db.pause_symbol(decision.symbol, duration_seconds=4 * 3600)
             self.db.save_reflex_decision(decision.model_dump(), executed=False)
             return {
                 "executed": False,
                 "emergency_flattened": True,
                 "symbol": decision.symbol,
-                "reason": f"SL placement failed after 3 retries ({sl_error}); position immediately market-sold.",
+                "reason": f"SL placement failed after 3 retries ({sl_error}); position market-sold.",
                 "emergency_sell_order": emergency_sell,
             }
 
