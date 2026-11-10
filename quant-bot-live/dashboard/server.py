@@ -123,6 +123,8 @@ def create_dashboard_app(
                     "max_position_usd": float(
                         sys_state.get("max_position_usd", str(settings.MAX_POSITION_USD))
                     ),
+                    "trading_mode": str(settings.TRADING_MODE).lower(),
+                    "is_paper": settings.is_paper,
                 },
                 "open_positions": open_positions,
                 "watchlist": watchlist,

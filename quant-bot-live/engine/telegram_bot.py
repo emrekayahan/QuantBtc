@@ -253,12 +253,16 @@ class TelegramNotifier:
             fut_used = max(0.0, fut_total - fut_free)
             active_mode_raw = state.get("active_trading_mode", "SPOT").upper()
             fut_lev = int(getattr(self.cfg, "FUTURES_DEFAULT_LEVERAGE", 20))
-            if active_mode_raw.startswith("FUTURE") or fut_free >= 3.0:
-                mode_badge = f"⚡ FUTURES {fut_lev}x (ISOLATED)"
+            is_paper = getattr(self.cfg, "is_paper", True)
+            env_badge = "🧪 PAPER" if is_paper else "🔴 LIVE"
+            if is_paper:
+                mode_badge = f"[{env_badge}] {active_mode_raw} (Sanal Bakiye)"
+            elif active_mode_raw.startswith("FUTURE") or fut_free >= 3.0:
+                mode_badge = f"[{env_badge}] ⚡ FUTURES {fut_lev}x (ISOLATED)"
             elif fut_total >= 5.0:
-                mode_badge = f"⚡ FUTURES {fut_lev}x AKTİF (Teminat Dolu -> Yeni Giriş: SPOT)"
+                mode_badge = f"[{env_badge}] ⚡ FUTURES {fut_lev}x AKTİF (Teminat Dolu -> Yeni Giriş: SPOT)"
             else:
-                mode_badge = "🪙 SPOT MODE (Min $11.50)"
+                mode_badge = f"[{env_badge}] 🪙 SPOT MODE (Min $11.50)"
             pnl = float(state.get("daily_realized_pnl_usd", "0.0") or 0.0)
             dd = float(state.get("current_drawdown_pct", "0.0") or 0.0)
             min_conf = float(state.get("min_confidence_threshold", str(self.cfg.MIN_CONFIDENCE_THRESHOLD)) or 0.68)

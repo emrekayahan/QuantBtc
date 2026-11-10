@@ -182,6 +182,110 @@ class ExecutionEngine:
             decision.symbol, decision.causal_timestamp_ms, prefix="QB"
         )
 
+        # === T0: PAPER TRADING SIMULATION PATH ===
+        if getattr(self.cfg, "is_paper", True):
+            logger.info("Executing paper trade for %s in %s mode (leverage=%dx)", decision.symbol, trading_mode, leverage)
+            fill_price = float(entry_price_fmt)
+            filled_qty = qty
+            cost_usd = round(filled_qty * fill_price, 4)
+            margin_usd = round(cost_usd / max(leverage, 1), 4)
+            exchange_order_id = f"PAPER_ENTRY_{decision.causal_timestamp_ms}"
+            sl_client_id = self.build_client_order_id(decision.symbol, decision.causal_timestamp_ms, prefix="QBSL")
+            sl_exchange_id = f"PAPER_SL_{decision.causal_timestamp_ms}"
+            stop_price = self.exchange.price_to_precision(decision.symbol, decision.invalidation_price)
+            limit_sl_price = self.exchange.price_to_precision(decision.symbol, decision.invalidation_price * 0.997)
+
+            self.db.upsert_order(
+                {
+                    "client_order_id": entry_client_id,
+                    "exchange_order_id": exchange_order_id,
+                    "symbol": decision.symbol,
+                    "side": "buy",
+                    "order_type": "limit",
+                    "status": "closed",
+                    "price": fill_price,
+                    "stop_price": None,
+                    "amount": qty,
+                    "filled": filled_qty,
+                    "cost_usd": cost_usd,
+                    "causal_timestamp_ms": decision.causal_timestamp_ms,
+                }
+            )
+            self.db.upsert_order(
+                {
+                    "client_order_id": sl_client_id,
+                    "exchange_order_id": sl_exchange_id,
+                    "symbol": decision.symbol,
+                    "side": "sell",
+                    "order_type": "STOP_LOSS_LIMIT",
+                    "status": "open",
+                    "price": float(limit_sl_price),
+                    "stop_price": float(stop_price),
+                    "amount": filled_qty,
+                    "filled": 0.0,
+                    "cost_usd": 0.0,
+                    "causal_timestamp_ms": decision.causal_timestamp_ms,
+                }
+            )
+
+            position_id = f"POS_{decision.symbol.replace('/', '')}_{decision.causal_timestamp_ms}"
+            self.db.open_position(
+                {
+                    "position_id": position_id,
+                    "symbol": decision.symbol,
+                    "status": "OPEN",
+                    "entry_client_order_id": entry_client_id,
+                    "entry_exchange_order_id": exchange_order_id,
+                    "sl_client_order_id": sl_client_id,
+                    "sl_exchange_order_id": sl_exchange_id,
+                    "entry_price": fill_price,
+                    "current_price": fill_price,
+                    "invalidation_price": float(stop_price),
+                    "take_profit_price": decision.take_profit_price,
+                    "quantity": filled_qty,
+                    "cost_usd": cost_usd,
+                    "direction_confidence": decision.direction_confidence,
+                    "setup_quality": decision.setup_quality,
+                    "regime": decision.regime,
+                    "opened_at_ms": int(time.time() * 1000),
+                    "market_type": trading_mode.lower(),
+                    "leverage": leverage,
+                    "margin_usd": margin_usd,
+                    "notional_usd": cost_usd,
+                    "sl_slippage_pct": 0.0,
+                    "is_paper": True,
+                }
+            )
+            self.db.save_reflex_decision(decision.model_dump(), executed=True)
+
+            if self.telegram is not None:
+                asyncio.create_task(
+                    self.telegram.notify_entry(
+                        symbol=decision.symbol,
+                        pos_id=position_id,
+                        entry_price=fill_price,
+                        qty=filled_qty,
+                        cost_usd=cost_usd,
+                        invalidation_price=float(stop_price),
+                        take_profit_price=decision.take_profit_price,
+                        confidence=decision.direction_confidence,
+                        regime=f"{decision.regime} (PAPER {trading_mode}{f' {leverage}x' if leverage > 1 else ''})",
+                    )
+                )
+
+            return {
+                "executed": True,
+                "emergency_flattened": False,
+                "position_id": position_id,
+                "trading_mode": trading_mode,
+                "leverage": leverage,
+                "entry_order": {"id": exchange_order_id, "clientOrderId": entry_client_id, "status": "closed", "filled": filled_qty, "price": fill_price},
+                "sl_order": {"id": sl_exchange_id, "clientOrderId": sl_client_id, "status": "open", "price": float(limit_sl_price), "stopPrice": float(stop_price)},
+                "position_usd": position_usd,
+                "quantity": filled_qty,
+                "is_paper": True,
+            }
+
         # Configure Isolated Margin & Leverage if running in FUTURES mode
         use_futures_client = (
             trading_mode == "FUTURES"
@@ -470,10 +574,12 @@ class ExecutionEngine:
         )
 
         position_id = f"POS_{decision.symbol.replace('/', '')}_{decision.causal_timestamp_ms}"
+        margin_usd = round(cost_usd / max(leverage, 1), 4) if use_futures_client else cost_usd
         self.db.open_position(
             {
                 "position_id": position_id,
                 "symbol": decision.symbol,
+                "status": "OPEN",
                 "entry_client_order_id": entry_client_id,
                 "entry_exchange_order_id": exchange_order_id,
                 "sl_client_order_id": sl_client_id,
@@ -488,6 +594,12 @@ class ExecutionEngine:
                 "setup_quality": decision.setup_quality,
                 "regime": decision.regime,
                 "opened_at_ms": int(time.time() * 1000),
+                "market_type": trading_mode.lower(),
+                "leverage": leverage,
+                "margin_usd": margin_usd,
+                "notional_usd": cost_usd,
+                "sl_slippage_pct": 0.0,
+                "is_paper": False,
             }
         )
         self.db.save_reflex_decision(decision.model_dump(), executed=True)
@@ -531,6 +643,28 @@ class ExecutionEngine:
         symbol = target["symbol"]
         qty = float(target["quantity"])
         sl_order_id = target.get("sl_exchange_order_id")
+
+        # In paper mode, do not send any close orders to Binance
+        if target.get("is_paper") or getattr(self.cfg, "is_paper", True):
+            exit_price = float(target.get("current_price") or target["entry_price"])
+            closed_pos = self.db.close_position(
+                position_id=position_id,
+                exit_price=exit_price,
+                close_reason=reason,
+            )
+            if self.telegram is not None and closed_pos:
+                asyncio.create_task(
+                    self.telegram.notify_exit(
+                        symbol=symbol,
+                        pos_id=position_id,
+                        entry_price=float(closed_pos.get("entry_price", target.get("entry_price", 0))),
+                        exit_price=exit_price,
+                        qty=qty,
+                        realized_pnl=float(closed_pos.get("realized_pnl_usd", 0.0)),
+                        reason=f"PAPER_{reason}",
+                    )
+                )
+            return {"closed": True, "position_id": position_id, "exit_price": exit_price, "is_paper": True}
 
         fut_positions = {}
         if hasattr(self.exchange, "fetch_active_futures_positions"):

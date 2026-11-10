@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import ccxt.async_support as ccxt
 import pytest
 
+from config.settings import Settings
 from database.db_manager import DatabaseManager
 from engine.exchange import BinanceExchangeWrapper
 from engine.execution import ExecutionEngine
@@ -119,12 +120,20 @@ async def test_idempotent_timeout_recovery_and_server_side_sl_placement(tmp_path
     ExecutionEngine queries fetch_order_by_client_order_id(), avoids duplicate entry orders,
     and immediately places the mandatory STOP_LOSS_LIMIT order.
     """
-    db = DatabaseManager(db_path=str(tmp_path / "idem_test.db"))
+    live_cfg = Settings(
+        TRADING_MODE="live",
+        BINANCE_API_KEY="dummy_key",
+        BINANCE_API_SECRET="dummy_secret",
+        DB_PATH=str(tmp_path / "idem_test.db"),
+    )
+    db = DatabaseManager(db_path=live_cfg.DB_PATH)
     try:
         stub = StubCCXTClient(fail_sl=False, timeout_first_entry=True)
-        exchange = BinanceExchangeWrapper(db=db, ccxt_client=stub)
-        risk = RiskEngine(db=db, exchange=exchange)
-        exec_engine = ExecutionEngine(exchange=exchange, db=db, risk_engine=risk)
+        exchange = BinanceExchangeWrapper(db=db, custom_settings=live_cfg, ccxt_client=stub)
+        risk = RiskEngine(db=db, custom_settings=live_cfg, exchange=exchange)
+        exec_engine = ExecutionEngine(
+            exchange=exchange, db=db, risk_engine=risk, custom_settings=live_cfg
+        )
 
         decision = make_valid_decision(symbol="BTC/USDT")
         result = await exec_engine.execute_approved_entry(decision=decision, free_usdt=500.0)
@@ -147,12 +156,20 @@ async def test_sl_failure_after_3_retries_triggers_immediate_market_sell_and_4h_
     Verify Zero Unprotected Exposure rule: if STOP_LOSS_LIMIT fails 3 times,
     immediately execute create_market_sell_order() and pause symbol for 4 hours.
     """
-    db = DatabaseManager(db_path=str(tmp_path / "sl_fail_test.db"))
+    live_cfg = Settings(
+        TRADING_MODE="live",
+        BINANCE_API_KEY="dummy_key",
+        BINANCE_API_SECRET="dummy_secret",
+        DB_PATH=str(tmp_path / "sl_fail_test.db"),
+    )
+    db = DatabaseManager(db_path=live_cfg.DB_PATH)
     try:
         stub = StubCCXTClient(fail_sl=True, timeout_first_entry=False)
-        exchange = BinanceExchangeWrapper(db=db, ccxt_client=stub)
-        risk = RiskEngine(db=db, exchange=exchange)
-        exec_engine = ExecutionEngine(exchange=exchange, db=db, risk_engine=risk)
+        exchange = BinanceExchangeWrapper(db=db, custom_settings=live_cfg, ccxt_client=stub)
+        risk = RiskEngine(db=db, custom_settings=live_cfg, exchange=exchange)
+        exec_engine = ExecutionEngine(
+            exchange=exchange, db=db, risk_engine=risk, custom_settings=live_cfg
+        )
 
         decision = make_valid_decision(symbol="BTC/USDT")
         result = await exec_engine.execute_approved_entry(decision=decision, free_usdt=500.0)

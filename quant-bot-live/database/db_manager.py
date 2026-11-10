@@ -142,7 +142,13 @@ class DatabaseManager:
                     regime VARCHAR DEFAULT 'trending',
                     opened_at_ms BIGINT NOT NULL,
                     closed_at_ms BIGINT,
-                    close_reason VARCHAR
+                    close_reason VARCHAR,
+                    market_type VARCHAR DEFAULT 'spot',
+                    leverage INTEGER DEFAULT 1,
+                    margin_usd DOUBLE DEFAULT 0.0,
+                    notional_usd DOUBLE DEFAULT 0.0,
+                    sl_slippage_pct DOUBLE DEFAULT 0.0,
+                    is_paper BOOLEAN DEFAULT FALSE
                 )
                 """
             )
@@ -192,6 +198,7 @@ class DatabaseManager:
                 "daily_realized_pnl_usd": "0.0",
                 "auth_error_banner": "",
                 "clock_drift_ms": "0",
+                "paper_wallet_balance_usdt": str(getattr(settings, "PAPER_STARTING_USDT", 30.0)),
             }
             now_ms = int(time.time() * 1000)
             for k, v in defaults.items():
@@ -203,6 +210,21 @@ class DatabaseManager:
                     """,
                     [k, v, now_ms],
                 )
+
+            # Idempotently add new columns to positions table if migrating existing DB
+            new_pos_cols = [
+                ("market_type", "VARCHAR DEFAULT 'spot'"),
+                ("leverage", "INTEGER DEFAULT 1"),
+                ("margin_usd", "DOUBLE DEFAULT 0.0"),
+                ("notional_usd", "DOUBLE DEFAULT 0.0"),
+                ("sl_slippage_pct", "DOUBLE DEFAULT 0.0"),
+                ("is_paper", "BOOLEAN DEFAULT FALSE"),
+            ]
+            for col_name, col_def in new_pos_cols:
+                try:
+                    self._conn.execute(f"ALTER TABLE positions ADD COLUMN {col_name} {col_def}")
+                except Exception:
+                    pass  # Column already exists
             # Migrate legacy 0.80 threshold to new baseline if untouched by Brier calibration
             row_conf = self._conn.execute(
                 "SELECT value FROM system_state WHERE key = 'min_confidence_threshold'"
@@ -492,18 +514,26 @@ class DatabaseManager:
                     sl_client_order_id, sl_exchange_order_id, entry_price, current_price,
                     invalidation_price, take_profit_price, quantity, cost_usd,
                     unrealized_pnl_usd, realized_pnl_usd, direction_confidence,
-                    setup_quality, regime, opened_at_ms
-                ) VALUES (?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 0.0, ?, ?, ?, ?)
+                    setup_quality, regime, opened_at_ms,
+                    market_type, leverage, margin_usd, notional_usd, sl_slippage_pct, is_paper
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 0.0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (position_id) DO UPDATE SET
-                    status = 'OPEN',
+                    status = EXCLUDED.status,
                     sl_client_order_id = COALESCE(EXCLUDED.sl_client_order_id, positions.sl_client_order_id),
                     sl_exchange_order_id = COALESCE(EXCLUDED.sl_exchange_order_id, positions.sl_exchange_order_id),
                     quantity = EXCLUDED.quantity,
-                    cost_usd = EXCLUDED.cost_usd
+                    cost_usd = EXCLUDED.cost_usd,
+                    market_type = EXCLUDED.market_type,
+                    leverage = EXCLUDED.leverage,
+                    margin_usd = EXCLUDED.margin_usd,
+                    notional_usd = EXCLUDED.notional_usd,
+                    sl_slippage_pct = EXCLUDED.sl_slippage_pct,
+                    is_paper = EXCLUDED.is_paper
                 """,
                 [
                     str(pos["position_id"]),
                     str(pos["symbol"]),
+                    str(pos.get("status", "OPEN")),
                     str(pos["entry_client_order_id"]),
                     pos.get("entry_exchange_order_id"),
                     pos.get("sl_client_order_id"),
@@ -518,6 +548,12 @@ class DatabaseManager:
                     int(pos.get("setup_quality", 2)),
                     str(pos.get("regime", "trending")),
                     int(pos.get("opened_at_ms", now_ms)),
+                    str(pos.get("market_type", "spot")),
+                    int(pos.get("leverage", 1)),
+                    float(pos.get("margin_usd", 0.0)),
+                    float(pos.get("notional_usd", pos["cost_usd"])),
+                    float(pos.get("sl_slippage_pct", 0.0)),
+                    bool(pos.get("is_paper", False)),
                 ],
             )
 
@@ -594,11 +630,13 @@ class DatabaseManager:
             pos["close_reason"] = close_reason
             return pos
 
-    def get_open_positions(self) -> List[Dict[str, Any]]:
+    def get_open_positions(self, include_unprotected: bool = True) -> List[Dict[str, Any]]:
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM positions WHERE status = 'OPEN' ORDER BY opened_at_ms DESC"
-            )
+            if include_unprotected:
+                query = "SELECT * FROM positions WHERE status IN ('OPEN', 'OPEN_UNPROTECTED') ORDER BY opened_at_ms DESC"
+            else:
+                query = "SELECT * FROM positions WHERE status = 'OPEN' ORDER BY opened_at_ms DESC"
+            cursor = self._conn.execute(query)
             cols = [d[0] for d in cursor.description]
             return [dict(zip(cols, r)) for r in cursor.fetchall()]
 
