@@ -191,7 +191,15 @@ class ExecutionEngine:
         try:
             if use_futures_client:
                 try:
-                    await self.exchange.configure_futures_isolated(decision.symbol, leverage=leverage)
+                    actual_lev = await self.exchange.configure_futures_isolated(
+                        decision.symbol, leverage=leverage
+                    )
+                    if actual_lev and actual_lev != leverage:
+                        position_usd = round((position_usd / max(leverage, 1)) * actual_lev, 2)
+                        leverage = int(actual_lev)
+                        qty = self.exchange.amount_to_precision(
+                            decision.symbol, position_usd / max(decision.entry_price, 1e-9)
+                        )
                     entry_order = await self.exchange.create_futures_order(
                         symbol=decision.symbol,
                         order_type="limit",

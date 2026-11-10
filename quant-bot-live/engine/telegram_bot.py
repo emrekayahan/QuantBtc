@@ -250,9 +250,10 @@ class TelegramNotifier:
             spot_free = float(state.get("spot_free_usdt") or state.get("free_usdt", "0.0") or 0.0)
             fut_free = float(state.get("futures_free_usdt", "0.0") or 0.0)
             active_mode_raw = state.get("active_trading_mode", "SPOT").upper()
+            fut_lev = int(getattr(self.cfg, "FUTURES_DEFAULT_LEVERAGE", 20))
             mode_badge = (
-                "⚡ FUTURES 2x-3x (ISOLATED)"
-                if active_mode_raw.startswith("FUTURE") or fut_free >= 5.0
+                f"⚡ FUTURES {fut_lev}x (ISOLATED)"
+                if active_mode_raw.startswith("FUTURE") or fut_free >= 3.0
                 else "🪙 SPOT MODE (Min $11.50)"
             )
             pnl = float(state.get("daily_realized_pnl_usd", "0.0") or 0.0)

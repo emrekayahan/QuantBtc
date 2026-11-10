@@ -111,15 +111,13 @@ class RiskEngine:
                     "f_quarter": f_quarter,
                     "position_usd": 0.0,
                     "trading_mode": "FUTURES",
-                    "leverage": 2,
+                    "leverage": int(getattr(self.cfg, "FUTURES_DEFAULT_LEVERAGE", 20)),
                     "reason": f"Futures free USDT ({avail_fut:.2f}) < {futures_min:.2f}",
                 }
-            leverage = 3 if (decision.setup_quality >= 3 and decision.direction_confidence >= 0.80) else int(
-                getattr(self.cfg, "FUTURES_DEFAULT_LEVERAGE", 2)
-            )
+            leverage = int(getattr(self.cfg, "FUTURES_DEFAULT_LEVERAGE", 20))
             base_margin = float(getattr(self.cfg, "FUTURES_MARGIN_USD", 4.50))
-            margin_usd = min(avail_fut * 0.90, max(4.0, base_margin))
-            target_usd = min(round(margin_usd * leverage, 2), max_pos_usd)
+            margin_usd = min(avail_fut * 0.85, max(2.5, base_margin))
+            target_usd = round(margin_usd * leverage, 2)
             return {
                 "approved": True,
                 "f_quarter": f_quarter,

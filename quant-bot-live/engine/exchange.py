@@ -285,20 +285,23 @@ class BinanceExchangeWrapper:
                 return perp_sym
         return symbol
 
-    async def configure_futures_isolated(self, symbol: str, leverage: int = 2) -> None:
-        """Configure 2x-3x ISOLATED margin mode for a USD-M Futures symbol."""
+    async def configure_futures_isolated(self, symbol: str, leverage: int = 20) -> int:
+        """Configure ISOLATED margin mode and target leverage (with automatic bracket fallback) for USD-M Futures."""
         if self.futures_client is None:
-            return
+            return leverage
         await self.ensure_futures_markets_loaded()
         fut_symbol = self.resolve_futures_symbol(symbol)
         try:
             await self.futures_client.set_margin_mode("ISOLATED", fut_symbol)
         except Exception as exc:
             logger.debug("Futures set_margin_mode(ISOLATED, %s) info: %s", fut_symbol, exc)
-        try:
-            await self.futures_client.set_leverage(int(leverage), fut_symbol)
-        except Exception as exc:
-            logger.debug("Futures set_leverage(%d, %s) info: %s", leverage, fut_symbol, exc)
+        for cand_lev in (int(leverage), 15, 10, 5, 3):
+            try:
+                await self.futures_client.set_leverage(cand_lev, fut_symbol)
+                return cand_lev
+            except Exception as exc:
+                logger.debug("Futures set_leverage(%d, %s) info: %s", cand_lev, fut_symbol, exc)
+        return leverage
 
     async def create_futures_order(
         self,
