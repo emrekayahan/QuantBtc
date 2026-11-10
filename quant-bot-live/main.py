@@ -179,7 +179,8 @@ class AutonomousQuantEngineOrchestrator:
                             symbol,
                             exec_res.get("position_id"),
                         )
-                        free_usdt = max(0.0, free_usdt - float(exec_res.get("position_usd", 0.0)))
+                        if exec_res.get("trading_mode") == "SPOT":
+                            free_usdt = max(0.0, free_usdt - float(exec_res.get("position_usd", 0.0)))
                     else:
                         logger.info(
                             "Proposal for %s not executed: %s", symbol, exec_res.get("reason")

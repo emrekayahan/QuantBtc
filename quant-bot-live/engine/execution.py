@@ -474,7 +474,7 @@ class ExecutionEngine:
     async def close_single_position_market(
         self, position_id: str, reason: str = "MANUAL_MARKET_CLOSE"
     ) -> Dict[str, Any]:
-        """Cancel open Server-Side SL order for a specific position and market-sell its tokens."""
+        """Cancel open Server-Side SL order for a specific position and market-sell its tokens/contracts."""
         open_positions = self.db.get_open_positions()
         target = next((p for p in open_positions if p["position_id"] == position_id), None)
         if target is None:
@@ -484,13 +484,45 @@ class ExecutionEngine:
         qty = float(target["quantity"])
         sl_order_id = target.get("sl_exchange_order_id")
 
-        if sl_order_id:
-            try:
-                await self.exchange.cancel_order(str(sl_order_id), symbol)
-            except Exception as exc:
-                logger.warning("Could not cancel SL order %s for %s: %s", sl_order_id, symbol, exc)
+        fut_positions = {}
+        if hasattr(self.exchange, "fetch_active_futures_positions"):
+            fut_positions = await self.exchange.fetch_active_futures_positions()
+        fut_pos = fut_positions.get(symbol)
 
-        sell_order = await self.exchange.create_market_sell_order(symbol, qty)
+        sell_order: Dict[str, Any] = {}
+        if fut_pos is not None and getattr(self.exchange, "futures_client", None) is not None:
+            fut_sym = self.exchange.resolve_futures_symbol(symbol)
+            if sl_order_id:
+                try:
+                    await self.exchange.futures_client.cancel_order(
+                        str(sl_order_id), fut_sym, params={"stop": True}
+                    )
+                except Exception:
+                    try:
+                        await self.exchange.futures_client.cancel_order(str(sl_order_id), fut_sym)
+                    except Exception:
+                        pass
+            contracts = abs(float(fut_pos.get("contracts") or qty))
+            if contracts > 0:
+                sell_order = await self.exchange.create_futures_order(
+                    symbol=symbol,
+                    order_type="market",
+                    side="sell",
+                    amount=contracts,
+                    price=None,
+                    params={"reduceOnly": True},
+                )
+        else:
+            if sl_order_id:
+                try:
+                    await self.exchange.cancel_order(str(sl_order_id), symbol)
+                except Exception as exc:
+                    logger.warning("Could not cancel SL order %s for %s: %s", sl_order_id, symbol, exc)
+            try:
+                sell_order = await self.exchange.create_market_sell_order(symbol, qty)
+            except Exception as exc:
+                logger.warning("Market sell warning on %s: %s", symbol, exc)
+
         exit_price = float(
             sell_order.get("average") or sell_order.get("price") or target["current_price"]
         )
@@ -509,6 +541,18 @@ class ExecutionEngine:
                     qty=qty,
                     realized_pnl=float(closed_pos.get("realized_pnl_usd", 0.0)),
                     reason=reason,
+                )
+            )
+        if (
+            "STOP_LOSS" in reason.upper()
+            and self.pre_trade_analyzer is not None
+            and getattr(self.pre_trade_analyzer, "mistake_learner", None) is not None
+            and closed_pos
+        ):
+            asyncio.create_task(
+                self.pre_trade_analyzer.mistake_learner.analyze_and_record_stop_loss(
+                    closed_pos=closed_pos,
+                    exit_reason=reason,
                 )
             )
         return {

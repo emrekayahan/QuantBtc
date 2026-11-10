@@ -358,6 +358,56 @@ class BinanceExchangeWrapper:
         await self.ensure_markets_loaded()
         return await self._with_backoff(lambda: self.client.fetch_order(order_id, symbol), clear_auth_banner=True)
 
+    async def fetch_futures_order(self, order_id: str, symbol: str) -> Optional[Dict[str, Any]]:
+        """Query USD-M Futures for a standard or conditional/algo Stop order by ID."""
+        if self.futures_client is None:
+            return None
+        await self.ensure_futures_markets_loaded()
+        fut_symbol = self.resolve_futures_symbol(symbol)
+        # 1. Try conditional/algo stop order lookup first (STOP_MARKET orders use algoId)
+        try:
+            return await self.futures_client.fetch_order(
+                order_id, fut_symbol, params={"stop": True}
+            )
+        except Exception:
+            pass
+        # 2. Fallback: scan recent conditional/algo stop orders for matching id
+        if hasattr(self.futures_client, "fetch_orders"):
+            try:
+                stop_orders = await self.futures_client.fetch_orders(
+                    fut_symbol, params={"stop": True}
+                )
+                for o in stop_orders:
+                    if str(o.get("id")) == str(order_id):
+                        return o
+            except Exception:
+                pass
+        # 3. Fallback: standard order lookup
+        try:
+            return await self.futures_client.fetch_order(order_id, fut_symbol)
+        except Exception as exc:
+            logger.debug("Could not fetch Futures order %s on %s: %s", order_id, symbol, exc)
+            return None
+
+    async def fetch_active_futures_positions(self) -> Dict[str, Dict[str, Any]]:
+        """Return dict of active USD-M Futures positions keyed by base symbol (e.g. 'ZEC/USDT')."""
+        if self.futures_client is None or not self.cfg.has_valid_binance_keys:
+            return {}
+        try:
+            await self.ensure_futures_markets_loaded()
+            positions = await self.futures_client.fetch_positions()
+            result: Dict[str, Dict[str, Any]] = {}
+            for p in positions:
+                contracts = abs(float(p.get("contracts") or 0.0))
+                if contracts > 0.0:
+                    raw_sym = str(p.get("symbol") or "")
+                    clean_sym = raw_sym.split(":")[0]
+                    result[clean_sym] = p
+            return result
+        except Exception as exc:
+            logger.debug("Could not fetch Futures positions: %s", exc)
+            return {}
+
     async def fetch_order_by_client_order_id(
         self, client_order_id: str, symbol: str
     ) -> Optional[Dict[str, Any]]:

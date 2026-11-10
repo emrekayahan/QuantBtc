@@ -62,11 +62,14 @@ class StateReconciler:
 
         open_positions = self.db.get_open_positions()
         tickers: Dict[str, Any] = {}
+        fut_positions: Dict[str, Dict[str, Any]] = {}
         if open_positions:
             try:
                 tickers = await self.exchange.fetch_tickers()
             except Exception as exc:
                 logger.warning("Reconciler failed to fetch tickers: %s", exc)
+            if hasattr(self.exchange, "fetch_active_futures_positions"):
+                fut_positions = await self.exchange.fetch_active_futures_positions()
 
         positions_value_usd = 0.0
         reconciled_closed = 0
@@ -78,6 +81,7 @@ class StateReconciler:
             qty = float(pos["quantity"])
             sl_order_id = pos.get("sl_exchange_order_id")
             tp_price = float(pos["take_profit_price"])
+            invalidation_price = float(pos["invalidation_price"])
 
             t = tickers.get(symbol, {})
             live_price = float(
@@ -85,16 +89,21 @@ class StateReconciler:
             )
             self.db.update_position_price(pos_id, live_price)
 
-            # Check if Server-Side SL filled on Binance
+            # Check if Server-Side SL filled on Binance (Futures or Spot)
             sl_filled = False
             if sl_order_id:
                 try:
-                    sl_info = await self.exchange.fetch_order(str(sl_order_id), symbol)
-                    sl_status = str(sl_info.get("status") or "").lower()
+                    sl_info = None
+                    if hasattr(self.exchange, "fetch_futures_order"):
+                        sl_info = await self.exchange.fetch_futures_order(str(sl_order_id), symbol)
+                    if sl_info is None:
+                        sl_info = await self.exchange.fetch_order(str(sl_order_id), symbol)
+                    sl_status = str((sl_info or {}).get("status") or "").lower()
                     if sl_status in ("closed", "filled"):
                         fill_p = float(
                             sl_info.get("average")
                             or sl_info.get("price")
+                            or sl_info.get("stopPrice")
                             or pos["invalidation_price"]
                         )
                         closed_p = self.db.close_position(
@@ -129,6 +138,17 @@ class StateReconciler:
             if sl_filled:
                 continue
 
+            # Check if Stop-Loss price reached or breached (Software SL Backup)
+            if live_price <= invalidation_price and self.execution is not None:
+                try:
+                    await self.execution.close_single_position_market(
+                        position_id=pos_id, reason="STOP_LOSS_HIT"
+                    )
+                    reconciled_closed += 1
+                    continue
+                except Exception as exc:
+                    logger.error("Failed to close position %s at Stop-Loss: %s", pos_id, exc)
+
             # Check if Take-Profit price reached
             if live_price >= tp_price and self.execution is not None:
                 try:
@@ -140,10 +160,14 @@ class StateReconciler:
                 except Exception as exc:
                     logger.error("Failed to close position %s at Take-Profit: %s", pos_id, exc)
 
-            positions_value_usd += qty * live_price
+            # Only add token value for Spot positions (Futures equity is already included in futures_total_usdt)
+            if symbol not in fut_positions:
+                positions_value_usd += qty * live_price
 
         total_equity_usd = total_usdt_cash + positions_value_usd
         prev_peak = float(self.db.get_state("peak_equity_usd", "0.0") or 0.0)
+        if prev_peak > total_equity_usd * 1.35:
+            prev_peak = total_equity_usd
         peak_equity = max(prev_peak, total_equity_usd)
         drawdown_pct = (
             ((peak_equity - total_equity_usd) / peak_equity) * 100.0 if peak_equity > 0.0 else 0.0

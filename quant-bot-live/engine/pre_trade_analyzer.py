@@ -140,7 +140,11 @@ class PreTradeAnalyzer:
                     max_tokens=220,
                 )
                 content = str(res.get("content") or "").strip()
-                if content and "•" in content:
+                if (
+                    content
+                    and "•" in content
+                    and not content.lower().startswith(("the user", "we need", "let's", "symbol:"))
+                ):
                     summary_text = content
             except Exception as exc:
                 logger.debug("PreTradeAnalyzer LLM summary fallback used: %s", exc)

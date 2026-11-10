@@ -144,8 +144,9 @@ class MistakeLearner:
                     deterministic_fallback=failure_reason,
                     max_tokens=140,
                 )
-                if res.get("content"):
-                    failure_reason = str(res["content"]).strip()[:280]
+                llm_text = str(res.get("content") or "").strip()
+                if llm_text and not llm_text.lower().startswith(("the user", "we need", "trade details", "let's")):
+                    failure_reason = llm_text[:280]
             except Exception as exc:
                 logger.debug("MistakeLearner LLM fallback used: %s", exc)
 
