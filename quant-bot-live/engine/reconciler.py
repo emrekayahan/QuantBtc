@@ -256,7 +256,8 @@ class StateReconciler:
             if symbol not in fut_positions:
                 positions_value_usd += qty * live_price
 
-        total_equity_usd = total_usdt_cash + positions_value_usd
+        # Single source of truth: total_equity = spot_equity (free + token values) + futures_wallet_balance (which includes unrealized PnL)
+        total_equity_usd = spot_total_usdt + positions_value_usd + futures_total_usdt
         prev_peak = float(self.db.get_state("peak_equity_usd", "0.0") or 0.0)
         if prev_peak > total_equity_usd * 1.35:
             prev_peak = total_equity_usd
