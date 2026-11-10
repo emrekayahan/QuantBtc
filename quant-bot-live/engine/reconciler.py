@@ -177,6 +177,7 @@ class StateReconciler:
         self.db.set_state("free_usdt", f"{free_usdt:.2f}")
         self.db.set_state("spot_free_usdt", f"{spot_free_usdt:.2f}")
         self.db.set_state("futures_free_usdt", f"{futures_free_usdt:.2f}")
+        self.db.set_state("futures_total_usdt", f"{futures_total_usdt:.2f}")
         self.db.set_state("active_trading_mode", active_mode)
         self.db.set_state("total_equity_usd", f"{total_equity_usd:.2f}")
         self.db.set_state("peak_equity_usd", f"{peak_equity:.2f}")

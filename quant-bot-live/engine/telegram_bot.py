@@ -249,18 +249,22 @@ class TelegramNotifier:
             eq = float(state.get("total_equity_usd", "0.0") or 0.0)
             spot_free = float(state.get("spot_free_usdt") or state.get("free_usdt", "0.0") or 0.0)
             fut_free = float(state.get("futures_free_usdt", "0.0") or 0.0)
+            fut_total = float(state.get("futures_total_usdt", str(fut_free)) or fut_free)
+            fut_used = max(0.0, fut_total - fut_free)
             active_mode_raw = state.get("active_trading_mode", "SPOT").upper()
             fut_lev = int(getattr(self.cfg, "FUTURES_DEFAULT_LEVERAGE", 20))
-            mode_badge = (
-                f"⚡ FUTURES {fut_lev}x (ISOLATED)"
-                if active_mode_raw.startswith("FUTURE") or fut_free >= 3.0
-                else "🪙 SPOT MODE (Min $11.50)"
-            )
+            if active_mode_raw.startswith("FUTURE") or fut_free >= 3.0:
+                mode_badge = f"⚡ FUTURES {fut_lev}x (ISOLATED)"
+            elif fut_total >= 5.0:
+                mode_badge = f"⚡ FUTURES {fut_lev}x AKTİF (Teminat Dolu -> Yeni Giriş: SPOT)"
+            else:
+                mode_badge = "🪙 SPOT MODE (Min $11.50)"
             pnl = float(state.get("daily_realized_pnl_usd", "0.0") or 0.0)
             dd = float(state.get("current_drawdown_pct", "0.0") or 0.0)
             min_conf = float(state.get("min_confidence_threshold", str(self.cfg.MIN_CONFIDENCE_THRESHOLD)) or 0.68)
             daily_trades = self.db.get_daily_trades_count() if hasattr(self.db, "get_daily_trades_count") else 0
-            max_daily_trades = int(getattr(self.cfg, "DAILY_MAX_TRADES", 2))
+            max_daily_trades = int(getattr(self.cfg, "DAILY_MAX_TRADES", 20))
+            open_pos = self.db.get_open_positions() if hasattr(self.db, "get_open_positions") else []
             regime = _clean_md(state.get("macro_regime", "Bilinmiyor").upper())
             commentary = _clean_md(state.get("macro_commentary", "Veri yok"))[:240]
             halted = state.get("system_halted", "false").lower() in ("true", "1")
@@ -271,8 +275,9 @@ class TelegramNotifier:
                 f"• *Durum:* {status_badge}\n"
                 f"• *Aktif İşlem Modu:* `{mode_badge}`\n"
                 f"• *Toplam Bakiye:* `${eq:,.2f}`\n"
-                f"• *Spot USDT:* `${spot_free:,.2f}`\n"
-                f"• *Futures USDT:* `${fut_free:,.2f}`\n"
+                f"• *Spot USDT (Boşta):* `${spot_free:,.2f}`\n"
+                f"• *Futures USDT:* `${fut_total:,.2f} Toplam (${fut_free:,.2f} Boşta / ${fut_used:,.2f} İşlemde)`\n"
+                f"• *Açık Pozisyonlar:* `{len(open_pos)} Adet`\n"
                 f"• *Günlük İşlem Kotası:* `{daily_trades} / {max_daily_trades}`\n"
                 f"• *Min Güven Eşiği:* `%{min_conf * 100:.0f}`\n"
                 f"• *Günlük K/Z:* `${pnl:+,.2f}`\n"
@@ -308,8 +313,13 @@ class TelegramNotifier:
                 return
             lines = [f"💼 *Açık Pozisyonlar ({len(open_pos)})*\n"]
             for p in open_pos:
+                sl_id = str(p.get("sl_exchange_order_id") or "")
+                p_mode = "⚡ FUTURES" if sl_id.startswith("2000") else "🪙 SPOT"
+                cur_p = float(p.get("current_price") or p["entry_price"])
+                upnl = float(p.get("unrealized_pnl_usd") or 0.0)
+                cost = float(p.get("cost_usd") or 0.0)
                 lines.append(
-                    f"• *{p['symbol']}* | Giriş: `${float(p['entry_price']):,.4f}` | Miktar: `{float(p['quantity']):.6f}` | TP: `${float(p['take_profit_price']):,.4f}` | SL: `${float(p['invalidation_price']):,.4f}`"
+                    f"• *{p['symbol']}* ({p_mode} `${cost:,.2f}`) | Giriş: `${float(p['entry_price']):,.4f}` → Güncel: `${cur_p:,.4f}` | K/Z: `${upnl:+,.2f}` | TP: `${float(p['take_profit_price']):,.4f}` | SL: `${float(p['invalidation_price']):,.4f}`"
                 )
             await self.send_message("\n".join(lines))
 
