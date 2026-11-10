@@ -90,8 +90,9 @@ class RiskEngine:
             stop_distance_pct=stop_dist_pct,
         )
         max_pos_usd = self.get_active_max_position_usd()
+        futures_enabled = bool(getattr(self.cfg, "ENABLE_FUTURES", False))
         futures_min = float(getattr(self.cfg, "FUTURES_MIN_USDT", 5.0))
-        is_futures = trading_mode.upper().startswith("FUTURE") or float(futures_free_usdt) >= futures_min
+        is_futures = futures_enabled and (trading_mode.upper().startswith("FUTURE") or float(futures_free_usdt) >= futures_min)
 
         if f_quarter <= 0.0:
             return {
@@ -111,10 +112,10 @@ class RiskEngine:
                     "f_quarter": f_quarter,
                     "position_usd": 0.0,
                     "trading_mode": "FUTURES",
-                    "leverage": int(getattr(self.cfg, "FUTURES_DEFAULT_LEVERAGE", 20)),
+                    "leverage": int(getattr(self.cfg, "effective_leverage", 3)),
                     "reason": f"Futures free USDT ({avail_fut:.2f}) < {futures_min:.2f}",
                 }
-            leverage = int(getattr(self.cfg, "FUTURES_DEFAULT_LEVERAGE", 3))
+            leverage = int(getattr(self.cfg, "effective_leverage", 3))
             base_margin = float(getattr(self.cfg, "FUTURES_MARGIN_USD", 4.50))
             margin_usd = min(avail_fut * 0.85, max(2.5, base_margin))
             target_usd = min(round(margin_usd * leverage, 2), max_pos_usd)
@@ -221,12 +222,25 @@ class RiskEngine:
                 "reason": f"Max drawdown limit reached ({drawdown_pct:.2f}%).",
             }
 
+        # Gross exposure and risk limit checks
         open_positions = self.db.get_open_positions()
-        if len(open_positions) >= int(self.cfg.MAX_OPEN_POSITIONS):
+        total_equity = float(self.db.get_state("total_equity_usd", "30.0") or 30.0)
+        current_notional = sum(float(p.get("notional_usd", p.get("cost_usd", 0.0))) for p in open_positions)
+        max_gross = total_equity * float(getattr(self.cfg, "MAX_GROSS_EXPOSURE_X", 1.0))
+        if current_notional >= max_gross and max_gross > 0.0:
             return {
                 "approved": False,
                 "position_usd": 0.0,
-                "reason": f"Open positions ({len(open_positions)}) >= MAX_OPEN_POSITIONS ({self.cfg.MAX_OPEN_POSITIONS}).",
+                "reason": f"Gross notional exposure (${current_notional:.2f}) exceeds cap (${max_gross:.2f}).",
+            }
+
+        # Correlated longs check
+        max_longs = min(int(self.cfg.MAX_OPEN_POSITIONS), int(getattr(self.cfg, "MAX_CORRELATED_LONGS", 2)))
+        if len(open_positions) >= max_longs:
+            return {
+                "approved": False,
+                "position_usd": 0.0,
+                "reason": f"Correlated longs cap reached ({len(open_positions)}/{max_longs}).",
             }
 
         if any(p["symbol"] == decision.symbol for p in open_positions):
