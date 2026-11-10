@@ -54,8 +54,7 @@ class DecisionReflexScorer:
             risk_state: RiskStateLiteral = "reduce"
         elif (
             state.current_drawdown_pct >= max_dd * 0.60
-            or state.open_positions_count == max_open - 1
-            or state.spread_bps > 12.0
+            or state.spread_bps > 20.0
         ):
             risk_state = "near_limit"
         else:

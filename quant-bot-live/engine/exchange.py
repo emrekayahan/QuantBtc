@@ -285,6 +285,28 @@ class BinanceExchangeWrapper:
                 return perp_sym
         return symbol
 
+    def futures_amount_to_precision(self, symbol: str, amount: float) -> float:
+        """Format order quantity to Binance USD-M Futures LOT_SIZE precision."""
+        try:
+            if self.futures_client is not None and self.futures_client.markets:
+                fut_sym = self.resolve_futures_symbol(symbol)
+                if fut_sym in self.futures_client.markets:
+                    return float(self.futures_client.amount_to_precision(fut_sym, amount))
+        except Exception:
+            pass
+        return self.amount_to_precision(symbol, amount)
+
+    def futures_price_to_precision(self, symbol: str, price: float) -> float:
+        """Format order price to Binance USD-M Futures PRICE_FILTER precision."""
+        try:
+            if self.futures_client is not None and self.futures_client.markets:
+                fut_sym = self.resolve_futures_symbol(symbol)
+                if fut_sym in self.futures_client.markets:
+                    return float(self.futures_client.price_to_precision(fut_sym, price))
+        except Exception:
+            pass
+        return self.price_to_precision(symbol, price)
+
     async def configure_futures_isolated(self, symbol: str, leverage: int = 20) -> int:
         """Configure ISOLATED margin mode and target leverage (with automatic bracket fallback) for USD-M Futures."""
         if self.futures_client is None:
@@ -317,11 +339,11 @@ class BinanceExchangeWrapper:
             raise RuntimeError("Futures client is not initialized")
         await self.ensure_futures_markets_loaded()
         fut_symbol = self.resolve_futures_symbol(symbol)
-        fmt_amount = self.amount_to_precision(symbol, amount)
-        fmt_price = self.price_to_precision(symbol, price) if price is not None else None
+        fmt_amount = self.futures_amount_to_precision(symbol, amount)
+        fmt_price = self.futures_price_to_precision(symbol, price) if price is not None else None
         extra_params = dict(params or {})
         if "stopPrice" in extra_params and extra_params["stopPrice"] is not None:
-            extra_params["stopPrice"] = self.price_to_precision(
+            extra_params["stopPrice"] = self.futures_price_to_precision(
                 symbol, float(extra_params["stopPrice"])
             )
         return await self.futures_client.create_order(

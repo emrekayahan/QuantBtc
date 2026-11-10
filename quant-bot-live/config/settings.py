@@ -47,7 +47,7 @@ class Settings(BaseSettings):
 
     # === RISK & CAPITAL GUARDRAILS ===
     TIMEFRAME: str = Field(default="15m")
-    MAX_OPEN_POSITIONS: int = Field(default=3, ge=1, le=20)
+    MAX_OPEN_POSITIONS: int = Field(default=5, ge=1, le=20)
     MAX_POSITION_USD: float = Field(default=25.0, gt=0.0)
     SPOT_MIN_POSITION_USD: float = Field(default=11.50, gt=0.0)
     FUTURES_MIN_USDT: float = Field(default=3.0, gt=0.0)

@@ -197,9 +197,9 @@ class ExecutionEngine:
                     if actual_lev and actual_lev != leverage:
                         position_usd = round((position_usd / max(leverage, 1)) * actual_lev, 2)
                         leverage = int(actual_lev)
-                        qty = self.exchange.amount_to_precision(
-                            decision.symbol, position_usd / max(decision.entry_price, 1e-9)
-                        )
+                    qty = self.exchange.futures_amount_to_precision(
+                        decision.symbol, position_usd / max(decision.entry_price, 1e-9)
+                    )
                     entry_order = await self.exchange.create_futures_order(
                         symbol=decision.symbol,
                         order_type="limit",
@@ -295,23 +295,38 @@ class ExecutionEngine:
             }
         )
 
-        # Determine net fillable token balance after Binance spot fee deduction
-        base_asset = decision.symbol.split("/")[0]
-        try:
-            balance = await self.exchange.fetch_balance()
-            free_base = float(balance.get("free", {}).get(base_asset, 0.0) or 0.0)
-            sl_raw_qty = min(filled_qty, free_base) if free_base > 0.0 else filled_qty * 0.999
-        except Exception:
-            sl_raw_qty = filled_qty * 0.999
+        # Determine net fillable token balance (on Spot deduct fee / check free token; on Futures use exact contract qty)
+        if use_futures_client:
+            sl_qty = self.exchange.futures_amount_to_precision(decision.symbol, filled_qty)
+            stop_price = self.exchange.futures_price_to_precision(
+                decision.symbol, decision.invalidation_price
+            )
+            limit_sl_price = self.exchange.futures_price_to_precision(
+                decision.symbol, decision.invalidation_price * 0.997
+            )
+        else:
+            base_asset = decision.symbol.split("/")[0]
+            try:
+                balance = await self.exchange.fetch_balance()
+                free_base = float(balance.get("free", {}).get(base_asset, 0.0) or 0.0)
+                sl_raw_qty = (
+                    min(filled_qty, free_base)
+                    if free_base >= filled_qty * 0.50
+                    else filled_qty * 0.999
+                )
+            except Exception:
+                sl_raw_qty = filled_qty * 0.999
 
-        sl_qty = self.exchange.amount_to_precision(decision.symbol, sl_raw_qty)
-        if sl_qty <= 0.0:
-            sl_qty = self.exchange.amount_to_precision(decision.symbol, filled_qty)
+            sl_qty = self.exchange.amount_to_precision(decision.symbol, sl_raw_qty)
+            if sl_qty <= 0.0:
+                sl_qty = self.exchange.amount_to_precision(decision.symbol, filled_qty)
 
-        stop_price = self.exchange.price_to_precision(decision.symbol, decision.invalidation_price)
-        limit_sl_price = self.exchange.price_to_precision(
-            decision.symbol, decision.invalidation_price * 0.997
-        )
+            stop_price = self.exchange.price_to_precision(
+                decision.symbol, decision.invalidation_price
+            )
+            limit_sl_price = self.exchange.price_to_precision(
+                decision.symbol, decision.invalidation_price * 0.997
+            )
         sl_client_id = self.build_client_order_id(
             decision.symbol, decision.causal_timestamp_ms, prefix="QBSL"
         )
@@ -367,7 +382,17 @@ class ExecutionEngine:
                 decision.symbol,
                 sl_error,
             )
-            emergency_sell = await self.exchange.create_market_sell_order(decision.symbol, sl_qty)
+            if use_futures_client:
+                emergency_sell = await self.exchange.create_futures_order(
+                    symbol=decision.symbol,
+                    order_type="market",
+                    side="sell",
+                    amount=sl_qty,
+                    price=None,
+                    params={"reduceOnly": True},
+                )
+            else:
+                emergency_sell = await self.exchange.create_market_sell_order(decision.symbol, sl_qty)
             self.db.pause_symbol(decision.symbol, duration_seconds=4 * 3600)
             self.db.save_reflex_decision(decision.model_dump(), executed=False)
             return {
