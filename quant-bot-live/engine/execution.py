@@ -272,7 +272,55 @@ class ExecutionEngine:
             await self.telegram.send_message(pre_trade_msg)
 
         exchange_order_id = str(entry_order.get("id") or entry_order.get("exchange_order_id") or "")
-        filled_qty = float(entry_order.get("filled") or entry_order.get("amount") or qty)
+        raw_filled = entry_order.get("filled")
+        filled_qty = float(raw_filled) if (raw_filled is not None and is_live_ccxt) else float(raw_filled or entry_order.get("amount") or qty)
+        order_status = str(entry_order.get("status") or "closed").lower()
+
+        if is_live_ccxt and (filled_qty <= 0.0 or order_status == "open"):
+            await asyncio.sleep(1.5)
+            refreshed = (
+                await self.exchange.fetch_futures_order(exchange_order_id, decision.symbol)
+                if use_futures_client and hasattr(self.exchange, "fetch_futures_order")
+                else await self.exchange.fetch_order(exchange_order_id, decision.symbol)
+            )
+            if refreshed:
+                entry_order = refreshed
+                filled_qty = float(entry_order.get("filled") or 0.0)
+                order_status = str(entry_order.get("status") or order_status).lower()
+
+            if order_status == "open":
+                try:
+                    if use_futures_client and getattr(self.exchange, "futures_client", None) is not None:
+                        fut_sym = self.exchange.resolve_futures_symbol(decision.symbol)
+                        await self.exchange.futures_client.cancel_order(exchange_order_id, fut_sym)
+                    else:
+                        await self.exchange.cancel_order(exchange_order_id, decision.symbol)
+                    order_status = "canceled" if filled_qty <= 0.0 else "closed"
+                except Exception as cancel_exc:
+                    logger.warning("Could not cancel remaining open entry order %s: %s", exchange_order_id, cancel_exc)
+
+            if filled_qty <= 0.0:
+                self.db.upsert_order(
+                    {
+                        "client_order_id": entry_client_id,
+                        "exchange_order_id": exchange_order_id,
+                        "symbol": decision.symbol,
+                        "side": "buy",
+                        "order_type": "limit",
+                        "status": "canceled",
+                        "price": float(entry_order.get("price") or entry_price_fmt),
+                        "stop_price": None,
+                        "amount": qty,
+                        "filled": 0.0,
+                        "cost_usd": 0.0,
+                        "causal_timestamp_ms": decision.causal_timestamp_ms,
+                    }
+                )
+                return {
+                    "executed": False,
+                    "reason": f"Limit buy order {exchange_order_id} did not fill immediately and was canceled.",
+                }
+
         fill_price = float(
             entry_order.get("average") or entry_order.get("price") or entry_price_fmt
         )
@@ -285,7 +333,7 @@ class ExecutionEngine:
                 "symbol": decision.symbol,
                 "side": "buy",
                 "order_type": "limit",
-                "status": str(entry_order.get("status") or "closed"),
+                "status": "closed" if filled_qty > 0.0 else order_status,
                 "price": fill_price,
                 "stop_price": None,
                 "amount": qty,

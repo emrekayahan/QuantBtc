@@ -99,7 +99,12 @@ class MistakeLearner:
         regime = str(closed_pos.get("regime") or self.db.get_state("macro_regime", "mean_reverting") or "mean_reverting")
         pnl = float(closed_pos.get("realized_pnl_usd", 0.0))
         entry_price = float(closed_pos.get("entry_price", 0.0))
-        exit_price = float(closed_pos.get("current_price") or closed_pos.get("invalidation_price") or 0.0)
+        exit_price = float(
+            closed_pos.get("exit_price")
+            or closed_pos.get("invalidation_price")
+            or closed_pos.get("current_price")
+            or 0.0
+        )
 
         snap = self.db.get_latest_state_snapshot(symbol) or {}
         entry_rsi = float(snap.get("rsi_14", 50.0))
@@ -114,20 +119,20 @@ class MistakeLearner:
             confidence_penalty = 0.08
         elif regime in ("mean_reverting", "high_vol") and entry_rsi > 31.0:
             failure_reason = (
-                f"Mean-Reverting rejimde erken dip denemesi (RSI={entry_rsi:.1f} > 31); "
+                f"Mean-Reverting/High-Vol rejimde erken giris (RSI={entry_rsi:.1f} > 31, SL={exit_price:.4f}); "
                 f"satis dalgasi tam tukenmeden girildi."
             )
             confidence_penalty = 0.06
         elif regime == "trending" and entry_rsi > 62.0:
             failure_reason = (
-                f"Trending rejimde yorgun momentum (RSI={entry_rsi:.1f}); "
+                f"Trending rejimde yorgun momentum (RSI={entry_rsi:.1f}, SL={exit_price:.4f}); "
                 f"lokal direnc kirilimi sahte kaldi."
             )
             confidence_penalty = 0.07
         else:
             failure_reason = (
                 f"{regime.upper()} rejiminde yuksek volatilite kaynakli SL temasi "
-                f"(RSI={entry_rsi:.1f}, OB={orderbook_imbalance:+.2f})."
+                f"(Giris={entry_price:.4f}, Cikis={exit_price:.4f}, RSI={entry_rsi:.1f}, OB={orderbook_imbalance:+.2f})."
             )
             confidence_penalty = 0.05
 
@@ -136,17 +141,26 @@ class MistakeLearner:
                 f"A crypto trade hit Stop-Loss. Symbol={symbol}, Regime={regime}, "
                 f"Entry={entry_price}, Exit={exit_price}, PnL=${pnl:.2f}, "
                 f"RSI={entry_rsi:.1f}, OrderbookImbalance={orderbook_imbalance:+.2f}.\n"
-                f"Write a 1-sentence Turkish lesson learned explaining why it failed and how to filter it next time."
+                f"Write ONLY a single concise Turkish sentence explaining why it failed and how to filter it next time."
             )
             try:
                 res = await self.openrouter_pool.complete_with_fallback(
                     prompt=prompt,
                     deterministic_fallback=failure_reason,
-                    max_tokens=140,
+                    max_tokens=120,
                 )
                 llm_text = str(res.get("content") or "").strip()
-                if llm_text and not llm_text.lower().startswith(("the user", "we need", "trade details", "let's")):
-                    failure_reason = llm_text[:280]
+                lower_t = llm_text.lower()
+                is_clean_single_sentence = (
+                    15 <= len(llm_text) <= 220
+                    and "\n" not in llm_text
+                    and not any(
+                        bad in lower_t
+                        for bad in ("the user", "we need", "trade details", "analysis", "let's", "symbol:")
+                    )
+                )
+                if is_clean_single_sentence:
+                    failure_reason = llm_text
             except Exception as exc:
                 logger.debug("MistakeLearner LLM fallback used: %s", exc)
 

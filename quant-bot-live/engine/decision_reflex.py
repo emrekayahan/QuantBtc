@@ -122,22 +122,24 @@ class DecisionReflexScorer:
                 or (lower_wick / candle_range) >= 0.30
             )
             cond_bb_support = (
-                state.closed_low <= state.bb_lower * 1.015
-                or state.closed_close <= state.bb_lower * 1.018
+                state.closed_low <= state.bb_lower * 1.012
+                or state.closed_close <= state.bb_lower * 1.015
             )
-            cond_rsi_oversold = state.rsi_14 < 36.0 or (
-                state.rsi_14 < 39.5 and state.rsi_14 > state.prev_rsi_14
+            cond_rsi_oversold = state.rsi_14 < 32.0 or (
+                state.rsi_14 < 35.0 and state.rsi_14 > state.prev_rsi_14 and cond_bb_support
             )
             cond_intraday_momentum = (
-                state.closed_close > state.ema_21
-                and state.ema_9 >= state.ema_21 * 0.998
-                and 42.0 <= state.rsi_14 <= 66.0
+                state.closed_close >= state.ema_21 * 1.002
+                and state.ema_9 > state.ema_21
+                and 50.0 <= state.rsi_14 <= 65.0
                 and state.closed_close > state.closed_open
-                and state.rsi_14 >= state.prev_rsi_14
+                and state.rsi_14 >= state.prev_rsi_14 + 0.5
+                and (state.vol_sma_20 <= 0 or state.closed_volume >= state.vol_sma_20 * 1.05)
+                and (state.regime != "high_vol" or (state.closed_close > state.ema_50 and state.orderbook_imbalance >= 0.0))
             )
-            cond_ob_ok = state.orderbook_imbalance > -0.45
+            cond_ob_ok = state.orderbook_imbalance > -0.25
 
-            if cond_rsi_oversold and (cond_bb_support or state.rsi_14 < 33.5) and cond_buying_pressure and cond_ob_ok:
+            if cond_rsi_oversold and cond_bb_support and cond_buying_pressure and cond_ob_ok:
                 direction = "long"
                 rsi_bonus = min(0.08, max(0.0, (36.0 - state.rsi_14) * 0.008))
                 ob_bonus = min(0.06, max(0.0, state.orderbook_imbalance) * 0.12)

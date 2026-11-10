@@ -47,13 +47,13 @@ class Settings(BaseSettings):
 
     # === RISK & CAPITAL GUARDRAILS ===
     TIMEFRAME: str = Field(default="15m")
-    MAX_OPEN_POSITIONS: int = Field(default=5, ge=1, le=20)
+    MAX_OPEN_POSITIONS: int = Field(default=3, ge=1, le=20)
     MAX_POSITION_USD: float = Field(default=25.0, gt=0.0)
     SPOT_MIN_POSITION_USD: float = Field(default=11.50, gt=0.0)
     FUTURES_MIN_USDT: float = Field(default=3.0, gt=0.0)
-    FUTURES_DEFAULT_LEVERAGE: int = Field(default=20, ge=1, le=50)
+    FUTURES_DEFAULT_LEVERAGE: int = Field(default=3, ge=1, le=50)
     FUTURES_MARGIN_USD: float = Field(default=4.50, gt=0.0)
-    DAILY_MAX_TRADES: int = Field(default=20, ge=1, le=100)
+    DAILY_MAX_TRADES: int = Field(default=6, ge=1, le=100)
     DAILY_MAX_LOSS_USD: float = Field(default=5.0, gt=0.0)
     MAX_DRAWDOWN_PCT: float = Field(default=15.0, gt=0.0, le=100.0)
     MIN_24H_VOLUME_USD: float = Field(default=10_000_000.0, gt=0.0)
@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     ROUND_TRIP_FEE_PCT: float = Field(default=0.20, ge=0.0, le=2.0)
 
     # === STORAGE, LOGS & DASHBOARD ===
-    DASHBOARD_HOST: str = Field(default="0.0.0.0")
+    DASHBOARD_HOST: str = Field(default="127.0.0.1")
     DASHBOARD_PORT: int = Field(default=8000, ge=1024, le=65535)
     DB_PATH: str = Field(default=str(BASE_DIR / "data" / "quant_bot.db"))
     LOG_DIR: str = Field(default=str(BASE_DIR / "logs"))

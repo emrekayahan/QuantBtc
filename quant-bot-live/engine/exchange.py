@@ -138,6 +138,11 @@ class BinanceExchangeWrapper:
         local_before = int(time.time() * 1000)
         server_time = await self._with_backoff(lambda: self.client.fetch_time())
         local_after = int(time.time() * 1000)
+        # If first call included cold DNS/TLS handshake (>120ms), take a warm measurement
+        if (local_after - local_before) > 120:
+            local_before = int(time.time() * 1000)
+            server_time = await self._with_backoff(lambda: self.client.fetch_time())
+            local_after = int(time.time() * 1000)
         local_mid = (local_before + local_after) // 2
         drift_ms = int(server_time) - local_mid
         if self.db is not None:
@@ -245,6 +250,7 @@ class BinanceExchangeWrapper:
         if self.db is not None:
             self.db.set_state("spot_free_usdt", f"{spot_free:.2f}")
             self.db.set_state("futures_free_usdt", f"{fut_free:.2f}")
+            self.db.set_state("futures_total_usdt", f"{fut_total:.2f}")
             self.db.set_state("active_trading_mode", active_mode)
             self.db.set_state("futures_api_enabled", "true" if enable_futures_perm else "false")
 
