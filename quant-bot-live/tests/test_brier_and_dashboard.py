@@ -44,7 +44,7 @@ async def test_overnight_brier_calibration_raises_threshold_when_overconfident(t
 
         assert res["sample_count"] == 2
         assert res["brier_score"] > 0.25
-        assert res["min_confidence_threshold"] == pytest.approx(0.83, abs=1e-4)
+        assert res["min_confidence_threshold"] == pytest.approx(0.71, abs=1e-4)
         assert res["max_position_usd"] == pytest.approx(20.0, abs=1e-2)
     finally:
         db.close()

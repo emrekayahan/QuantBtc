@@ -12,6 +12,7 @@ import ccxt.async_support as ccxt
 from config.settings import Settings, settings
 from database.db_manager import DatabaseManager
 from engine.exchange import BinanceExchangeWrapper
+from engine.pre_trade_analyzer import PreTradeAnalyzer
 from engine.risk_engine import RiskEngine
 from engine.schemas import ReflexDecisionSchema
 
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class ExecutionEngine:
-    """Executes spot long entries idempotently and places atomic Server-Side Stop-Loss orders."""
+    """Executes spot or isolated futures long entries idempotently and places atomic Server-Side Stop-Loss orders."""
 
     def __init__(
         self,
@@ -28,12 +29,18 @@ class ExecutionEngine:
         risk_engine: RiskEngine,
         custom_settings: Optional[Settings] = None,
         telegram: Optional[Any] = None,
+        pre_trade_analyzer: Optional[PreTradeAnalyzer] = None,
     ) -> None:
         self.exchange = exchange
         self.db = db
         self.risk_engine = risk_engine
         self.cfg = custom_settings or settings
         self.telegram = telegram
+        self.pre_trade_analyzer = pre_trade_analyzer or PreTradeAnalyzer(
+            db=db,
+            exchange=exchange,
+            telegram=telegram,
+        )
 
     @staticmethod
     def build_client_order_id(symbol: str, causal_timestamp_ms: int, prefix: str = "QB") -> str:
@@ -101,21 +108,29 @@ class ExecutionEngine:
         self,
         decision: ReflexDecisionSchema,
         free_usdt: float,
+        futures_free_usdt: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
-        1. Pass decision through RiskEngine.evaluate_gate().
-        2. Place idempotent entry order with QB_{SYMBOL}_{CAUSAL_TS} clientOrderId.
-        3. Within 500ms of fill, check actual free token balance via fetch_balance() and place
-           STOP_LOSS_LIMIT with stopPrice = invalidation_price and price = invalidation_price * 0.997.
-        4. If STOP_LOSS_LIMIT fails after 3 retries, immediately market-sell the position and pause symbol for 4 hours.
+        1. Auto-detect Dual Wallet mode: FUTURES (2x-3x Isolated) if futures_free_usdt >= $5.0, else SPOT.
+        2. Pass decision through RiskEngine.evaluate_gate() (includes Daily Max 2 Trades cap).
+        3. Pass through PreTradeAnalyzer (Orderbook Wall + Mistake Learner + 3-bullet Telegram briefing).
+        4. Place idempotent entry order with QB_{SYMBOL}_{CAUSAL_TS} clientOrderId and Server-Side Stop-Loss.
         """
         await self.exchange.ensure_markets_loaded()
         min_notional = self.exchange.get_min_notional(decision.symbol, default_min_usd=10.0)
+
+        if futures_free_usdt is None:
+            futures_free_usdt = float(self.db.get_state("futures_free_usdt", "0.0") or 0.0)
+
+        futures_min = float(getattr(self.cfg, "FUTURES_MIN_USDT", 5.0))
+        trading_mode = "FUTURES" if float(futures_free_usdt) >= futures_min else "SPOT"
 
         gate = self.risk_engine.evaluate_gate(
             decision=decision,
             free_usdt=free_usdt,
             min_notional_usd=min_notional,
+            trading_mode=trading_mode,
+            futures_free_usdt=float(futures_free_usdt),
         )
         if not gate["approved"]:
             self.db.save_reflex_decision(decision.model_dump(), executed=False)
@@ -126,6 +141,26 @@ class ExecutionEngine:
             }
 
         position_usd = float(gate["position_usd"])
+        leverage = int(gate.get("leverage", 1))
+        trading_mode = str(gate.get("trading_mode", trading_mode))
+
+        # Step 3: Pre-Trade Deep Analysis Gate (Orderbook Imbalance + Mistake Learner + 3-bullet Telegram summary)
+        if self.pre_trade_analyzer is not None:
+            pre_check = await self.pre_trade_analyzer.analyze_before_execution(
+                decision=decision,
+                trading_mode=trading_mode,
+                position_usd=position_usd,
+                leverage=leverage,
+                min_confidence=self.risk_engine.get_active_min_confidence(),
+            )
+            if not pre_check.get("approved", True):
+                self.db.save_reflex_decision(decision.model_dump(), executed=False)
+                return {
+                    "executed": False,
+                    "reason": pre_check.get("reason", "Pre-Trade Gate rejected"),
+                    "decision": decision.model_dump(),
+                }
+
         raw_qty = position_usd / max(decision.entry_price, 1e-9)
         qty = self.exchange.amount_to_precision(decision.symbol, raw_qty)
         entry_price_fmt = self.exchange.price_to_precision(decision.symbol, decision.entry_price)
@@ -140,16 +175,32 @@ class ExecutionEngine:
             decision.symbol, decision.causal_timestamp_ms, prefix="QB"
         )
 
-        # Place entry order idempotently
-        entry_order = await self._place_order_idempotently(
-            symbol=decision.symbol,
-            order_type="limit",
-            side="buy",
-            amount=qty,
-            price=entry_price_fmt,
-            client_order_id=entry_client_id,
-            max_attempts=3,
+        # Configure Isolated Margin & Leverage if running in FUTURES mode
+        use_futures_client = (
+            trading_mode == "FUTURES"
+            and getattr(self.exchange, "futures_client", None) is not None
         )
+        if use_futures_client:
+            await self.exchange.configure_futures_isolated(decision.symbol, leverage=leverage)
+            entry_order = await self.exchange.create_futures_order(
+                symbol=decision.symbol,
+                order_type="limit",
+                side="buy",
+                amount=qty,
+                price=entry_price_fmt,
+                params={"newClientOrderId": entry_client_id},
+            )
+        else:
+            # Place Spot entry order idempotently
+            entry_order = await self._place_order_idempotently(
+                symbol=decision.symbol,
+                order_type="limit",
+                side="buy",
+                amount=qty,
+                price=entry_price_fmt,
+                client_order_id=entry_client_id,
+                max_attempts=3,
+            )
 
         exchange_order_id = str(entry_order.get("id") or entry_order.get("exchange_order_id") or "")
         filled_qty = float(entry_order.get("filled") or entry_order.get("amount") or qty)
@@ -201,18 +252,32 @@ class ExecutionEngine:
         sl_error: Optional[Exception] = None
         for sl_attempt in range(1, 4):
             try:
-                sl_order = await self.exchange.create_order(
-                    symbol=decision.symbol,
-                    order_type="STOP_LOSS_LIMIT",
-                    side="sell",
-                    amount=sl_qty,
-                    price=limit_sl_price,
-                    params={
-                        "stopPrice": stop_price,
-                        "timeInForce": "GTC",
-                        "newClientOrderId": sl_client_id,
-                    },
-                )
+                if use_futures_client:
+                    sl_order = await self.exchange.create_futures_order(
+                        symbol=decision.symbol,
+                        order_type="STOP",
+                        side="sell",
+                        amount=sl_qty,
+                        price=limit_sl_price,
+                        params={
+                            "stopPrice": stop_price,
+                            "reduceOnly": True,
+                            "newClientOrderId": sl_client_id,
+                        },
+                    )
+                else:
+                    sl_order = await self.exchange.create_order(
+                        symbol=decision.symbol,
+                        order_type="STOP_LOSS_LIMIT",
+                        side="sell",
+                        amount=sl_qty,
+                        price=limit_sl_price,
+                        params={
+                            "stopPrice": stop_price,
+                            "timeInForce": "GTC",
+                            "newClientOrderId": sl_client_id,
+                        },
+                    )
                 break
             except Exception as exc:
                 sl_error = exc
@@ -285,10 +350,27 @@ class ExecutionEngine:
         )
         self.db.save_reflex_decision(decision.model_dump(), executed=True)
 
+        if self.telegram is not None:
+            asyncio.create_task(
+                self.telegram.notify_entry(
+                    symbol=decision.symbol,
+                    pos_id=position_id,
+                    entry_price=fill_price,
+                    qty=sl_qty,
+                    cost_usd=cost_usd,
+                    invalidation_price=stop_price,
+                    take_profit_price=decision.take_profit_price,
+                    confidence=decision.direction_confidence,
+                    regime=f"{decision.regime} ({trading_mode}{f' {leverage}x' if leverage > 1 else ''})",
+                )
+            )
+
         return {
             "executed": True,
             "emergency_flattened": False,
             "position_id": position_id,
+            "trading_mode": trading_mode,
+            "leverage": leverage,
             "entry_order": entry_order,
             "sl_order": sl_order,
             "position_usd": position_usd,

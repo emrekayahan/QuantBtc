@@ -65,9 +65,10 @@ class TelegramNotifier:
                 f"{self.base_url}/setMyCommands",
                 json={
                     "commands": [
-                        {"command": "durum", "description": "Kasa bakiyesi, rejim ve sistem özeti"},
+                        {"command": "durum", "description": "Kasa bakiyesi (Spot/Futures), aktif mod ve özet"},
                         {"command": "liste", "description": "İzleme listesi, RSI ve güven puanları"},
                         {"command": "pozisyonlar", "description": "Açık işlem ve emirler"},
+                        {"command": "dersler", "description": "Öğrenilen hatalar ve aktif güven cezaları"},
                         {"command": "audit", "description": "Son 24 saatlik Brier kalibrasyonu"},
                         {"command": "panic", "description": "Acil Durum: Her şeyi kapat ve kilitle"},
                         {"command": "baslat", "description": "Durdurulmuş sistemi tekrar aktif et"},
@@ -229,10 +230,11 @@ class TelegramNotifier:
 
         if cmd in ("/start", "/help", "/yardim", "/yardım"):
             msg = (
-                "🤖 *QuantBot Live v3.0 Komut Listesi*\n\n"
-                "• `/durum` veya `/status` — Kasa bakiyesi, rejim ve sistem özeti\n"
+                "🤖 *QuantBot Live v3.1 Komut Listesi*\n\n"
+                "• `/durum` veya `/status` — Kasa bakiyesi (Spot/Futures), aktif mod ve özet\n"
                 "• `/liste` veya `/watchlist` — İzleme listesi, RSI ve güven puanları\n"
                 "• `/pozisyonlar` veya `/pos` — Açık işlem ve emirler\n"
+                "• `/dersler` veya `/lessons` — Öğrenilen hatalar ve aktif kurallar\n"
                 "• `/audit` veya `/brier` — Son 24 saatlik Brier kalibrasyonu\n"
                 "• `/panic` veya `/stop` — 🚨 Acil Durum: Her şeyi kapat ve sistemi kilitle\n"
                 "• `/baslat` veya `/resume` — Durdurulmuş sistemi tekrar aktif et"
@@ -245,9 +247,19 @@ class TelegramNotifier:
                 return
             state = self.db.get_all_system_state()
             eq = float(state.get("total_equity_usd", "0.0") or 0.0)
-            free = float(state.get("free_usdt", "0.0") or 0.0)
+            spot_free = float(state.get("spot_free_usdt") or state.get("free_usdt", "0.0") or 0.0)
+            fut_free = float(state.get("futures_free_usdt", "0.0") or 0.0)
+            active_mode_raw = state.get("active_trading_mode", "SPOT").upper()
+            mode_badge = (
+                "⚡ FUTURES 2x-3x (ISOLATED)"
+                if active_mode_raw.startswith("FUTURE") or fut_free >= 5.0
+                else "🪙 SPOT MODE (Min $11.50)"
+            )
             pnl = float(state.get("daily_realized_pnl_usd", "0.0") or 0.0)
             dd = float(state.get("current_drawdown_pct", "0.0") or 0.0)
+            min_conf = float(state.get("min_confidence_threshold", str(self.cfg.MIN_CONFIDENCE_THRESHOLD)) or 0.68)
+            daily_trades = self.db.get_daily_trades_count() if hasattr(self.db, "get_daily_trades_count") else 0
+            max_daily_trades = int(getattr(self.cfg, "DAILY_MAX_TRADES", 2))
             regime = _clean_md(state.get("macro_regime", "Bilinmiyor").upper())
             commentary = _clean_md(state.get("macro_commentary", "Veri yok"))[:240]
             halted = state.get("system_halted", "false").lower() in ("true", "1")
@@ -256,8 +268,12 @@ class TelegramNotifier:
             msg = (
                 f"📊 *SİSTEM DURUM RAPORU*\n\n"
                 f"• *Durum:* {status_badge}\n"
+                f"• *Aktif İşlem Modu:* `{mode_badge}`\n"
                 f"• *Toplam Bakiye:* `${eq:,.2f}`\n"
-                f"• *Serbest USDT:* `${free:,.2f}`\n"
+                f"• *Spot USDT:* `${spot_free:,.2f}`\n"
+                f"• *Futures USDT:* `${fut_free:,.2f}`\n"
+                f"• *Günlük İşlem Kotası:* `{daily_trades} / {max_daily_trades}`\n"
+                f"• *Min Güven Eşiği:* `%{min_conf * 100:.0f}`\n"
                 f"• *Günlük K/Z:* `${pnl:+,.2f}`\n"
                 f"• *Drawdown:* `%{dd:.2f}`\n"
                 f"• *Piyasa Rejimi:* `{regime}`\n"
@@ -293,6 +309,33 @@ class TelegramNotifier:
             for p in open_pos:
                 lines.append(
                     f"• *{p['symbol']}* | Giriş: `${float(p['entry_price']):,.4f}` | Miktar: `{float(p['quantity']):.6f}` | TP: `${float(p['take_profit_price']):,.4f}` | SL: `${float(p['invalidation_price']):,.4f}`"
+                )
+            await self.send_message("\n".join(lines))
+
+        elif cmd in ("/dersler", "/ders", "/lessons"):
+            if not self.db or not hasattr(self.db, "get_trade_lessons"):
+                await self.send_message("❌ Veritabanı bağlantısı henüz hazır değil.")
+                return
+            lessons = self.db.get_trade_lessons(limit=8)
+            if not lessons:
+                await self.send_message(
+                    "📚 *Öğrenilen Kurallar (Mistake Learner)*\n\n"
+                    "✅ Henüz Stop-Loss kaynaklı kayıtlı bir hata dersi bulunmuyor. "
+                    "Herhangi bir işlem SL olduğunda giriş/çıkış koşulları analiz edilip buraya kaydedilir."
+                )
+                return
+            lines = [f"📚 *Öğrenilen Kurallar ({len(lessons)} Kayıt)*\n"]
+            for idx, item in enumerate(lessons, start=1):
+                sym = _clean_md(item.get("symbol", "?"))
+                reg = _clean_md(str(item.get("regime", "")).upper())
+                rsi = float(item.get("entry_rsi", 50.0))
+                ob = float(item.get("orderbook_imbalance", 0.0))
+                pnl = float(item.get("pnl", 0.0))
+                pen = float(item.get("confidence_penalty", 0.05)) * 100.0
+                reason = _clean_md(item.get("failure_reason", ""))[:140]
+                lines.append(
+                    f"{idx}. *{sym}* (`{reg}`) | K/Z: `${pnl:+,.2f}` | RSI: `{rsi:.1f}` | OB: `{ob:+.2f}` | Ceza: `-%{pen:.0f}`\n"
+                    f"   ↳ _{reason}_"
                 )
             await self.send_message("\n".join(lines))
 

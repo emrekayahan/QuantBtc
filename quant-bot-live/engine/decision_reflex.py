@@ -114,32 +114,50 @@ class DecisionReflexScorer:
                 reasons.append(f"No Trend setup ({passed}/5 conditions met).")
 
         elif state.regime in ("mean_reverting", "high_vol"):
-            # Sub-Strategy 2: Mean Reversion Dip (regime == 'mean_reverting')
-            # Spec: Price > EMA(200) (macro uptrend intact), Price touches lower Bollinger Band (20, 2sigma),
-            # RSI(14) < 34 turning up on closed candle
-            cond_macro_up = state.closed_close > state.ema_200
-            cond_bb_touch = state.closed_low <= state.bb_lower * 1.002 or state.closed_close <= state.bb_lower * 1.005
-            cond_rsi_oversold_turn = state.rsi_14 < 34.0 and state.rsi_14 > state.prev_rsi_14
+            # Sub-Strategy 2: Regime-Aware Mean Reversion Dip (regime == 'mean_reverting' or 'high_vol')
+            # Do NOT require price > EMA50 or price > EMA200 for Longs in mean_reverting regime.
+            # Score Q >= 2 and Confidence >= 0.70 when RSI_14 < 32 (or < 34 turning up),
+            # price is near lower Bollinger Band/support, and the closed candle shows buying pressure.
+            candle_range = max(state.closed_high - state.closed_low, 1e-9)
+            lower_wick = min(state.closed_open, state.closed_close) - state.closed_low
+            cond_buying_pressure = (
+                state.closed_close >= state.closed_open
+                or state.rsi_14 > state.prev_rsi_14
+                or (lower_wick / candle_range) >= 0.35
+            )
+            cond_bb_support = (
+                state.closed_low <= state.bb_lower * 1.008
+                or state.closed_close <= state.bb_lower * 1.010
+            )
+            cond_rsi_oversold = state.rsi_14 < 32.0 or (
+                state.rsi_14 < 34.0 and state.rsi_14 > state.prev_rsi_14
+            )
             cond_ob_ok = state.orderbook_imbalance > -0.35
 
-            if cond_macro_up and cond_bb_touch and cond_rsi_oversold_turn and cond_ob_ok:
+            if cond_rsi_oversold and cond_bb_support and cond_buying_pressure and cond_ob_ok:
                 direction = "long"
-                if state.orderbook_imbalance >= 0.0 and state.closed_close > state.closed_open:
+                rsi_bonus = min(0.08, max(0.0, (32.0 - state.rsi_14) * 0.008))
+                ob_bonus = min(0.06, max(0.0, state.orderbook_imbalance) * 0.12)
+                if state.closed_close > state.closed_open and (
+                    state.orderbook_imbalance >= 0.0 or state.rsi_14 < 28.0
+                ):
                     setup_quality = 3
-                    confidence = min(0.95, 0.86 + min(0.06, max(0.0, state.orderbook_imbalance) * 0.12))
+                    confidence = min(0.94, 0.78 + rsi_bonus + ob_bonus)
                 else:
                     setup_quality = 2
-                    confidence = 0.83
+                    confidence = min(0.88, max(0.72, 0.72 + rsi_bonus + ob_bonus))
                 reasons.append(
-                    f"Mean Reversion Dip Long: Close({state.closed_close:.4f})>EMA200({state.ema_200:.4f}), "
-                    f"Low({state.closed_low:.4f})<=BB_Lower({state.bb_lower:.4f}), "
-                    f"RSI({state.prev_rsi_14:.1f}->{state.rsi_14:.1f}) turning up"
+                    f"Mean Reversion Dip Long: Low({state.closed_low:.4f})~BB_Lower({state.bb_lower:.4f}), "
+                    f"RSI={state.rsi_14:.1f} (prev {state.prev_rsi_14:.1f}), "
+                    f"BuyingPressure=True, OB_Imb={state.orderbook_imbalance:+.2f}"
                 )
-            elif cond_macro_up and (cond_bb_touch or cond_rsi_oversold_turn):
+            elif (cond_bb_support or cond_rsi_oversold) and cond_ob_ok:
                 direction = "long"
                 setup_quality = 1
-                confidence = 0.58
-                reasons.append("Developing Mean Reversion dip; awaiting full RSI turn + BB touch.")
+                confidence = 0.60
+                reasons.append(
+                    f"Developing Mean Reversion dip (RSI={state.rsi_14:.1f}, Low={state.closed_low:.4f} vs BB_Low={state.bb_lower:.4f}); awaiting confirmation."
+                )
             else:
                 reasons.append("Neutral oscillating state inside Bollinger Bands.")
 

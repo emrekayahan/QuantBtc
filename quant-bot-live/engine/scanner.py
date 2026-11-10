@@ -46,7 +46,33 @@ EXCLUDED_BASE_ASSETS = {
     "JPY",
     "AUD",
     "PAXG",
+    # Synthetic / Tokenized Stocks
+    "NVDAB",
+    "SNDKB",
+    "TSLAB",
+    "AAPLB",
+    "MSFTB",
+    "GOOGLB",
+    "AMZNB",
+    "METAB",
+    "NFLXB",
+    "COINB",
+    "MSTRB",
+    "AMDB",
+    "INTCB",
+    "BABAB",
+    "SPYB",
+    "QQQB",
+    "PLTRB",
+    "MU",
+    "MUB",
+    "SMCI",
+    "SMCIB",
+    "ARMB",
+    "HOODB",
 }
+
+ALLOWED_CRYPTO_ENDING_IN_B = {"BNB", "ARB", "SHIB", "TRB", "CKB", "PHB", "AMB", "RLB", "OKB", "BGB", "BTCB"}
 
 EXCLUDED_LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR", "3L", "3S", "2L", "2S")
 
@@ -123,6 +149,9 @@ class AutonomousMarketScanner:
         if base in EXCLUDED_BASE_ASSETS:
             return False
         if any(base.endswith(suffix) for suffix in EXCLUDED_LEVERAGED_SUFFIXES):
+            return False
+        # Filter out synthetic/tokenized stocks ending in 'B' (e.g. NVDAB, SNDKB, TSLAB)
+        if len(base) >= 4 and base.endswith("B") and base not in ALLOWED_CRYPTO_ENDING_IN_B:
             return False
         return True
 

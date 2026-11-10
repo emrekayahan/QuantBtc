@@ -11,12 +11,13 @@ from config.settings import Settings, settings
 from database.db_manager import DatabaseManager
 from engine.exchange import BinanceExchangeWrapper
 from engine.execution import ExecutionEngine
+from engine.mistake_learner import MistakeLearner
 
 logger = logging.getLogger(__name__)
 
 
 class StateReconciler:
-    """Synchronizes DuckDB open positions, server-side stop-losses, and USDT equity every 30 seconds."""
+    """Synchronizes DuckDB open positions, server-side stop-losses, and dual-wallet USDT equity every 30 seconds."""
 
     def __init__(
         self,
@@ -25,22 +26,39 @@ class StateReconciler:
         execution: Optional[ExecutionEngine] = None,
         custom_settings: Optional[Settings] = None,
         telegram: Optional[Any] = None,
+        mistake_learner: Optional[MistakeLearner] = None,
     ) -> None:
         self.exchange = exchange
         self.db = db
         self.execution = execution
         self.cfg = custom_settings or settings
         self.telegram = telegram
+        self.mistake_learner = mistake_learner or MistakeLearner(
+            db=db, telegram=telegram
+        )
 
     async def reconcile_cycle(self) -> Dict[str, Any]:
         """
-        1. Fetch live Binance balance and tickers.
+        1. Fetch live Binance Spot & USD-M Futures balances and tickers.
         2. Update current prices, unrealized PnL, total USDT equity, peak equity, and drawdown %.
         3. Check if any open position hit take_profit_price or if its Server-Side SL filled on Binance.
         """
-        balance = await self.exchange.fetch_balance()
-        free_usdt = float(balance.get("free", {}).get("USDT", 0.0) or 0.0)
-        total_usdt_cash = float(balance.get("total", {}).get("USDT", free_usdt) or free_usdt)
+        if hasattr(self.exchange, "fetch_dual_wallet_balances"):
+            dual = await self.exchange.fetch_dual_wallet_balances()
+            spot_free_usdt = float(dual.get("spot_free_usdt", 0.0))
+            spot_total_usdt = float(dual.get("spot_total_usdt", spot_free_usdt))
+            futures_free_usdt = float(dual.get("futures_free_usdt", 0.0))
+            futures_total_usdt = float(dual.get("futures_total_usdt", futures_free_usdt))
+            active_mode = str(dual.get("active_mode", "SPOT"))
+            free_usdt = spot_free_usdt
+            total_usdt_cash = spot_total_usdt + futures_total_usdt
+        else:
+            balance = await self.exchange.fetch_balance()
+            free_usdt = float(balance.get("free", {}).get("USDT", 0.0) or 0.0)
+            total_usdt_cash = float(balance.get("total", {}).get("USDT", free_usdt) or free_usdt)
+            spot_free_usdt = free_usdt
+            futures_free_usdt = 0.0
+            active_mode = "SPOT"
 
         open_positions = self.db.get_open_positions()
         tickers: Dict[str, Any] = {}
@@ -98,6 +116,13 @@ class StateReconciler:
                                     reason="SERVER_SIDE_STOP_LOSS_FILLED",
                                 )
                             )
+                        if self.mistake_learner is not None and closed_p:
+                            asyncio.create_task(
+                                self.mistake_learner.analyze_and_record_stop_loss(
+                                    closed_pos=closed_p,
+                                    exit_reason="SERVER_SIDE_STOP_LOSS_FILLED",
+                                )
+                            )
                 except Exception as exc:
                     logger.debug("Could not fetch SL order %s for %s: %s", sl_order_id, symbol, exc)
 
@@ -126,6 +151,9 @@ class StateReconciler:
         daily_pnl = self.db.get_daily_realized_pnl()
 
         self.db.set_state("free_usdt", f"{free_usdt:.2f}")
+        self.db.set_state("spot_free_usdt", f"{spot_free_usdt:.2f}")
+        self.db.set_state("futures_free_usdt", f"{futures_free_usdt:.2f}")
+        self.db.set_state("active_trading_mode", active_mode)
         self.db.set_state("total_equity_usd", f"{total_equity_usd:.2f}")
         self.db.set_state("peak_equity_usd", f"{peak_equity:.2f}")
         self.db.set_state("current_drawdown_pct", f"{max(0.0, drawdown_pct):.2f}")
@@ -138,6 +166,9 @@ class StateReconciler:
 
         return {
             "free_usdt": round(free_usdt, 2),
+            "spot_free_usdt": round(spot_free_usdt, 2),
+            "futures_free_usdt": round(futures_free_usdt, 2),
+            "active_trading_mode": active_mode,
             "total_equity_usd": round(total_equity_usd, 2),
             "drawdown_pct": round(max(0.0, drawdown_pct), 2),
             "daily_realized_pnl_usd": round(daily_pnl, 2),

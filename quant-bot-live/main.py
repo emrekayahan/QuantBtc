@@ -20,7 +20,9 @@ from database.db_manager import DatabaseManager
 from engine.decision_reflex import DecisionReflexScorer
 from engine.exchange import BinanceExchangeWrapper
 from engine.execution import ExecutionEngine
+from engine.mistake_learner import MistakeLearner
 from engine.openrouter_pool import OpenRouterPool
+from engine.pre_trade_analyzer import PreTradeAnalyzer
 from engine.reconciler import StateReconciler
 from engine.telegram_bot import TelegramNotifier
 from engine.risk_engine import RiskEngine
@@ -64,17 +66,31 @@ class AutonomousQuantEngineOrchestrator:
             db=self.db,
             risk_engine=self.risk_engine,
         )
+        self.mistake_learner = MistakeLearner(
+            db=self.db,
+            openrouter_pool=self.openrouter_pool,
+            telegram=self.telegram,
+        )
+        self.pre_trade_analyzer = PreTradeAnalyzer(
+            db=self.db,
+            exchange=self.exchange,
+            openrouter_pool=self.openrouter_pool,
+            telegram=self.telegram,
+            mistake_learner=self.mistake_learner,
+        )
         self.execution_engine = ExecutionEngine(
             exchange=self.exchange,
             db=self.db,
             risk_engine=self.risk_engine,
             telegram=self.telegram,
+            pre_trade_analyzer=self.pre_trade_analyzer,
         )
         self.reconciler = StateReconciler(
             exchange=self.exchange,
             db=self.db,
             execution=self.execution_engine,
             telegram=self.telegram,
+            mistake_learner=self.mistake_learner,
         )
         self.overnight_reviewer = OvernightBrierReviewer(
             db=self.db,
@@ -92,18 +108,18 @@ class AutonomousQuantEngineOrchestrator:
         except Exception as exc:
             logger.warning("Clock drift check warning during bootstrap: %s", exc)
 
+        if self.cfg_has_keys():
+            try:
+                await self.reconciler.reconcile_cycle()
+            except Exception as exc:
+                logger.warning("Initial balance/position reconciliation warning: %s", exc)
+
         try:
             await self.exchange.ensure_markets_loaded()
             await self.scanner.run_scan_cycle()
             await self.evaluate_watchlist_reflex_cycle()
         except Exception as exc:
             logger.error("Initial market scan failed (will retry on schedule): %s", exc)
-
-        if self.cfg_has_keys():
-            try:
-                await self.reconciler.reconcile_cycle()
-            except Exception as exc:
-                logger.warning("Initial balance/position reconciliation warning: %s", exc)
 
     @staticmethod
     def cfg_has_keys() -> bool:

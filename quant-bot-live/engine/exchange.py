@@ -31,6 +31,7 @@ class BinanceExchangeWrapper:
 
         if ccxt_client is not None:
             self.client = ccxt_client
+            self.futures_client = None
         else:
             exchange_config: Dict[str, Any] = {
                 "enableRateLimit": True,
@@ -52,6 +53,24 @@ class BinanceExchangeWrapper:
             # so US-based Cloud VMs do not hit HTTP 451 on public market data endpoints
             if hasattr(self.client, "urls") and "api" in self.client.urls:
                 self.client.urls["api"]["public"] = "https://data-api.binance.vision/api/v3"
+
+            # Optional USD-M Futures client for auto-detecting Futures funding (>= $5.0 USDT)
+            futures_config: Dict[str, Any] = {
+                "enableRateLimit": True,
+                "timeout": 10000,
+                "options": {
+                    "defaultType": "future",
+                    "fetchMarkets": ["linear"],
+                    "adjustForTimeDifference": True,
+                    "recvWindow": 10000,
+                    "fetchCurrencies": False,
+                },
+            }
+            if self.cfg.has_valid_binance_keys:
+                futures_config["apiKey"] = self.cfg.BINANCE_API_KEY
+                futures_config["secret"] = self.cfg.BINANCE_API_SECRET
+            self.futures_client = ccxt.binance(futures_config)
+        self._futures_markets_loaded = False
 
     async def _with_backoff(self, coro_factory: Callable[[], Any], max_retries: int = 3, clear_auth_banner: bool = False) -> Any:
         delay = 0.5
@@ -180,6 +199,94 @@ class BinanceExchangeWrapper:
         await self.ensure_markets_loaded()
         return await self._with_backoff(lambda: self.client.fetch_balance(), clear_auth_banner=True)
 
+    async def fetch_futures_balance(self) -> Dict[str, float]:
+        """Safely query USD-M Futures USDT balance; returns 0.0 if Futures is unactivated or lacks permission."""
+        if self.futures_client is None or not self.cfg.has_valid_binance_keys:
+            return {"free": 0.0, "total": 0.0}
+        try:
+            bal = await self.futures_client.fetch_balance()
+            free_u = float(bal.get("free", {}).get("USDT", 0.0) or 0.0)
+            total_u = float(bal.get("total", {}).get("USDT", free_u) or free_u)
+            return {"free": free_u, "total": total_u}
+        except Exception as exc:
+            logger.debug("USD-M Futures balance check skipped/unavailable: %s", exc)
+            return {"free": 0.0, "total": 0.0}
+
+    async def fetch_dual_wallet_balances(self) -> Dict[str, Any]:
+        """
+        Query both Spot and USD-M Futures wallets and auto-detect trading mode:
+        - If futures_free_usdt >= FUTURES_MIN_USDT ($5.0): enable 'FUTURES' (2x-3x Isolated).
+        - Otherwise: run in 'SPOT' mode using spot_free_usdt.
+        """
+        spot_bal = await self.fetch_balance()
+        spot_free = float(spot_bal.get("free", {}).get("USDT", 0.0) or 0.0)
+        spot_total = float(spot_bal.get("total", {}).get("USDT", spot_free) or spot_free)
+
+        fut_bal = await self.fetch_futures_balance()
+        fut_free = float(fut_bal.get("free", 0.0))
+        fut_total = float(fut_bal.get("total", 0.0))
+
+        futures_min = float(getattr(self.cfg, "FUTURES_MIN_USDT", 5.0))
+        active_mode = "FUTURES" if fut_free >= futures_min else "SPOT"
+
+        if self.db is not None:
+            self.db.set_state("spot_free_usdt", f"{spot_free:.2f}")
+            self.db.set_state("futures_free_usdt", f"{fut_free:.2f}")
+            self.db.set_state("active_trading_mode", active_mode)
+
+        return {
+            "spot_free_usdt": spot_free,
+            "spot_total_usdt": spot_total,
+            "futures_free_usdt": fut_free,
+            "futures_total_usdt": fut_total,
+            "active_mode": active_mode,
+        }
+
+    async def configure_futures_isolated(self, symbol: str, leverage: int = 2) -> None:
+        """Configure 2x-3x ISOLATED margin mode for a USD-M Futures symbol."""
+        if self.futures_client is None:
+            return
+        if not self._futures_markets_loaded:
+            try:
+                await self.futures_client.load_markets()
+                self._futures_markets_loaded = True
+            except Exception as exc:
+                logger.debug("Futures load_markets warning: %s", exc)
+        try:
+            await self.futures_client.set_margin_mode("ISOLATED", symbol)
+        except Exception as exc:
+            logger.debug("Futures set_margin_mode(ISOLATED, %s) info: %s", symbol, exc)
+        try:
+            await self.futures_client.set_leverage(int(leverage), symbol)
+        except Exception as exc:
+            logger.debug("Futures set_leverage(%d, %s) info: %s", leverage, symbol, exc)
+
+    async def create_futures_order(
+        self,
+        symbol: str,
+        order_type: str,
+        side: str,
+        amount: float,
+        price: Optional[float] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Place an order on USD-M Futures when FUTURES mode is active."""
+        if self.futures_client is None:
+            raise RuntimeError("Futures client is not initialized")
+        if not self._futures_markets_loaded:
+            await self.futures_client.load_markets()
+            self._futures_markets_loaded = True
+        fmt_amount = self.amount_to_precision(symbol, amount)
+        fmt_price = self.price_to_precision(symbol, price) if price is not None else None
+        extra_params = dict(params or {})
+        if "stopPrice" in extra_params and extra_params["stopPrice"] is not None:
+            extra_params["stopPrice"] = self.price_to_precision(
+                symbol, float(extra_params["stopPrice"])
+            )
+        return await self.futures_client.create_order(
+            symbol, order_type, side, fmt_amount, fmt_price, extra_params
+        )
+
     async def fetch_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         await self.ensure_markets_loaded()
         return await self._with_backoff(lambda: self.client.fetch_open_orders(symbol), clear_auth_banner=True)
@@ -261,3 +368,8 @@ class BinanceExchangeWrapper:
     async def close(self) -> None:
         if hasattr(self.client, "close"):
             await self.client.close()
+        if getattr(self, "futures_client", None) is not None and hasattr(self.futures_client, "close"):
+            try:
+                await self.futures_client.close()
+            except Exception:
+                pass

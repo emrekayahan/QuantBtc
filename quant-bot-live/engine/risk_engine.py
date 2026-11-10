@@ -69,8 +69,17 @@ class RiskEngine:
         decision: ReflexDecisionSchema,
         free_usdt: float,
         min_notional_usd: float = 10.0,
+        trading_mode: str = "SPOT",
+        futures_free_usdt: float = 0.0,
     ) -> Dict[str, Any]:
-        """Compute Quarter-Kelly position size in USD bounded by MAX_POSITION_USD and Binance minNotional * 1.10."""
+        """
+        Compute position size in USD for either SPOT or FUTURES (2x-3x Isolated):
+        - If FUTURES mode (`futures_free_usdt >= 5.0` or `trading_mode == 'FUTURES'`):
+          Use ~$4-$5 margin at 2x-3x leverage.
+        - If SPOT mode (`futures_free_usdt < 5.0`):
+          Enforce `max(kelly_usd_size, 11.50)` when `free_usdt >= 11.50` so orders with $30.59 balance
+          always clear Binance's $5-$10 MIN_NOTIONAL filter cleanly.
+        """
         stop_dist_pct = abs(decision.entry_price - decision.invalidation_price) / max(
             decision.entry_price, 1e-9
         )
@@ -81,16 +90,65 @@ class RiskEngine:
             stop_distance_pct=stop_dist_pct,
         )
         max_pos_usd = self.get_active_max_position_usd()
-        target_usd = min(float(free_usdt) * f_quarter, max_pos_usd)
-        min_required_usd = float(min_notional_usd) * 1.10
+        futures_min = float(getattr(self.cfg, "FUTURES_MIN_USDT", 5.0))
+        is_futures = trading_mode.upper().startswith("FUTURE") or float(futures_free_usdt) >= futures_min
 
-        if target_usd < min_required_usd:
+        if f_quarter <= 0.0:
             return {
                 "approved": False,
                 "f_quarter": f_quarter,
                 "position_usd": 0.0,
+                "trading_mode": "FUTURES" if is_futures else "SPOT",
+                "leverage": 1,
+                "reason": "Quarter-Kelly fraction is 0.0 (negative edge).",
+            }
+
+        if is_futures:
+            avail_fut = float(futures_free_usdt) if float(futures_free_usdt) >= futures_min else float(free_usdt)
+            if avail_fut < futures_min:
+                return {
+                    "approved": False,
+                    "f_quarter": f_quarter,
+                    "position_usd": 0.0,
+                    "trading_mode": "FUTURES",
+                    "leverage": 2,
+                    "reason": f"Futures free USDT ({avail_fut:.2f}) < {futures_min:.2f}",
+                }
+            leverage = 3 if (decision.setup_quality >= 3 and decision.direction_confidence >= 0.80) else int(
+                getattr(self.cfg, "FUTURES_DEFAULT_LEVERAGE", 2)
+            )
+            base_margin = float(getattr(self.cfg, "FUTURES_MARGIN_USD", 4.50))
+            margin_usd = min(avail_fut * 0.90, max(4.0, base_margin))
+            target_usd = min(round(margin_usd * leverage, 2), max_pos_usd)
+            return {
+                "approved": True,
+                "f_quarter": f_quarter,
+                "position_usd": round(target_usd, 2),
+                "margin_usd": round(margin_usd, 2),
+                "trading_mode": "FUTURES",
+                "leverage": leverage,
+                "reason": f"Futures {leverage}x Isolated sizing valid (margin=${margin_usd:.2f}, notional=${target_usd:.2f}).",
+            }
+
+        # SPOT MODE: Enforce minimum position size max(kelly_usd_size, 11.50) when free_usdt >= 11.50
+        spot_min_pos = float(getattr(self.cfg, "SPOT_MIN_POSITION_USD", 11.50))
+        min_required_usd = max(float(min_notional_usd) * 1.10, spot_min_pos)
+        kelly_usd_size = float(free_usdt) * f_quarter
+
+        if float(free_usdt) >= min_required_usd:
+            target_usd = min(max(kelly_usd_size, spot_min_pos), max_pos_usd, float(free_usdt) * 0.98)
+        else:
+            target_usd = min(kelly_usd_size, max_pos_usd)
+
+        if target_usd < float(min_notional_usd) * 1.10:
+            return {
+                "approved": False,
+                "f_quarter": f_quarter,
+                "position_usd": 0.0,
+                "trading_mode": "SPOT",
+                "leverage": 1,
                 "reason": (
-                    f"Target USD ({target_usd:.2f}) below minNotional*1.10 ({min_required_usd:.2f})"
+                    f"Target USD ({target_usd:.2f}) below minNotional*1.10 ({float(min_notional_usd) * 1.10:.2f})"
                 ),
             }
 
@@ -98,7 +156,9 @@ class RiskEngine:
             "approved": True,
             "f_quarter": f_quarter,
             "position_usd": round(target_usd, 2),
-            "reason": "Quarter-Kelly sizing valid.",
+            "trading_mode": "SPOT",
+            "leverage": 1,
+            "reason": "Spot Quarter-Kelly sizing valid.",
         }
 
     def evaluate_gate(
@@ -106,15 +166,18 @@ class RiskEngine:
         decision: ReflexDecisionSchema,
         free_usdt: float,
         min_notional_usd: float = 10.0,
+        trading_mode: str = "SPOT",
+        futures_free_usdt: float = 0.0,
     ) -> Dict[str, Any]:
         """
         Verify ALL non-negotiable execution gate conditions:
         - decision.direction == 'long'
         - decision.setup_quality >= 2
-        - decision.direction_confidence >= 0.80 (or Brier-adjusted threshold)
+        - decision.direction_confidence >= 0.68 (or Brier-adjusted threshold)
         - decision.risk_state == 'safe' and decision.toxic_flow == 'none'
         - decision.regime != 'crisis'
         - open_positions < settings.MAX_OPEN_POSITIONS
+        - daily_trades_count < settings.DAILY_MAX_TRADES (max 2 trades/day)
         - system_halted == False
         """
         if self.db.is_system_halted():
@@ -126,6 +189,17 @@ class RiskEngine:
                 "position_usd": 0.0,
                 "reason": f"Symbol {decision.symbol} is temporarily paused.",
             }
+
+        # Strict Daily Trade Cap (Max 2 Trades/Day)
+        if hasattr(self.db, "get_daily_trades_count"):
+            daily_trades = self.db.get_daily_trades_count()
+            max_daily_trades = int(getattr(self.cfg, "DAILY_MAX_TRADES", 2))
+            if daily_trades >= max_daily_trades:
+                return {
+                    "approved": False,
+                    "position_usd": 0.0,
+                    "reason": f"Daily trade cap reached ({daily_trades}/{max_daily_trades} trades today).",
+                }
 
         daily_pnl = self.db.get_daily_realized_pnl()
         if daily_pnl <= -abs(float(self.cfg.DAILY_MAX_LOSS_USD)):
@@ -207,6 +281,8 @@ class RiskEngine:
             decision=decision,
             free_usdt=free_usdt,
             min_notional_usd=min_notional_usd,
+            trading_mode=trading_mode,
+            futures_free_usdt=futures_free_usdt,
         )
         return sizing
 

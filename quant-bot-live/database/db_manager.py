@@ -159,6 +159,21 @@ class DatabaseManager:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trade_lessons (
+                    id VARCHAR PRIMARY KEY,
+                    symbol VARCHAR NOT NULL,
+                    regime VARCHAR NOT NULL,
+                    entry_rsi DOUBLE NOT NULL,
+                    orderbook_imbalance DOUBLE NOT NULL,
+                    pnl DOUBLE NOT NULL,
+                    failure_reason VARCHAR NOT NULL,
+                    confidence_penalty DOUBLE NOT NULL,
+                    created_at BIGINT NOT NULL
+                )
+                """
+            )
 
             # Seed default system state keys if not present
             defaults = {
@@ -169,6 +184,9 @@ class DatabaseManager:
                 "max_position_usd": str(settings.MAX_POSITION_USD),
                 "total_equity_usd": "0.0",
                 "free_usdt": "0.0",
+                "spot_free_usdt": "0.0",
+                "futures_free_usdt": "0.0",
+                "active_trading_mode": "SPOT",
                 "peak_equity_usd": "0.0",
                 "current_drawdown_pct": "0.0",
                 "daily_realized_pnl_usd": "0.0",
@@ -184,6 +202,15 @@ class DatabaseManager:
                     ON CONFLICT (key) DO NOTHING
                     """,
                     [k, v, now_ms],
+                )
+            # Migrate legacy 0.80 threshold to new baseline if untouched by Brier calibration
+            row_conf = self._conn.execute(
+                "SELECT value FROM system_state WHERE key = 'min_confidence_threshold'"
+            ).fetchone()
+            if row_conf and row_conf[0] in ("0.8", "0.80") and settings.MIN_CONFIDENCE_THRESHOLD < 0.80:
+                self._conn.execute(
+                    "UPDATE system_state SET value = ?, updated_at_ms = ? WHERE key = 'min_confidence_threshold'",
+                    [str(settings.MIN_CONFIDENCE_THRESHOLD), now_ms],
                 )
 
     def set_state(self, key: str, value: Any) -> None:
@@ -596,6 +623,92 @@ class DatabaseManager:
                 [start_of_day_ms],
             ).fetchone()
             return float(row[0]) if row else 0.0
+
+    def get_daily_trades_count(self) -> int:
+        """Return total number of positions opened during the current UTC day."""
+        start_of_day_ms = int((int(time.time()) // 86400) * 86400 * 1000)
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM positions
+                WHERE opened_at_ms >= ?
+                """,
+                [start_of_day_ms],
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def get_latest_state_snapshot(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Retrieve the most recent state snapshot for a symbol."""
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                SELECT * FROM state_snapshots
+                WHERE symbol = ?
+                ORDER BY causal_timestamp_ms DESC
+                LIMIT 1
+                """,
+                [symbol],
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cols = [d[0] for d in cursor.description]
+            return dict(zip(cols, row))
+
+    def add_trade_lesson(self, lesson: Dict[str, Any]) -> None:
+        """Persist a Stop-Loss failure lesson in the trade_lessons table."""
+        now_ms = int(time.time() * 1000)
+        lesson_id = str(lesson.get("id") or f"{lesson['symbol']}_{now_ms}")
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO trade_lessons (
+                    id, symbol, regime, entry_rsi, orderbook_imbalance,
+                    pnl, failure_reason, confidence_penalty, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (id) DO UPDATE SET
+                    failure_reason = EXCLUDED.failure_reason,
+                    confidence_penalty = EXCLUDED.confidence_penalty,
+                    created_at = EXCLUDED.created_at
+                """,
+                [
+                    lesson_id,
+                    str(lesson["symbol"]),
+                    str(lesson.get("regime", "mean_reverting")),
+                    float(lesson.get("entry_rsi", 50.0)),
+                    float(lesson.get("orderbook_imbalance", 0.0)),
+                    float(lesson.get("pnl", 0.0)),
+                    str(lesson.get("failure_reason", "STOP_LOSS_HIT")),
+                    float(lesson.get("confidence_penalty", 0.05)),
+                    int(lesson.get("created_at", now_ms)),
+                ],
+            )
+
+    def get_trade_lessons(
+        self,
+        symbol: Optional[str] = None,
+        regime: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Fetch recent learned rules/mistakes from trade_lessons."""
+        query = "SELECT id, symbol, regime, entry_rsi, orderbook_imbalance, pnl, failure_reason, confidence_penalty, created_at FROM trade_lessons"
+        params: List[Any] = []
+        clauses: List[str] = []
+        if symbol:
+            clauses.append("symbol = ?")
+            params.append(symbol)
+        if regime:
+            clauses.append("regime = ?")
+            params.append(regime)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            cursor = self._conn.execute(query, params)
+            cols = [d[0] for d in cursor.description]
+            return [dict(zip(cols, r)) for r in cursor.fetchall()]
 
     def save_brier_calibration(
         self,
