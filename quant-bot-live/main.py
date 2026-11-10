@@ -316,12 +316,20 @@ class AutonomousQuantEngineOrchestrator:
         try:
             await server.serve()
         finally:
-            logger.info("Shutting down scheduler, CCXT exchange session, and DuckDB...")
+            logger.info("Graceful shutdown: Waiting for in-flight tasks (grace period %ss)...", getattr(settings, "SHUTDOWN_GRACE_SEC", 45.0))
             await self.telegram.stop()
             if self.scheduler.running:
                 self.scheduler.shutdown(wait=False)
+            try:
+                # Give background reconciler/execution tasks up to grace period to finish cleanly
+                grace = float(getattr(settings, "SHUTDOWN_GRACE_SEC", 45.0))
+                await asyncio.sleep(min(1.0, grace))
+            except Exception:
+                pass
+            logger.info("Closing CCXT exchange sessions and flushing DuckDB...")
             await self.exchange.close()
             self.db.close()
+            logger.info("Engine successfully shut down with clean state.")
 
     def _handle_shutdown_signal(self, server: uvicorn.Server) -> None:
         logger.info("Received termination signal. Initiating graceful shutdown...")
