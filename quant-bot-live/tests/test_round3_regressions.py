@@ -645,3 +645,165 @@ async def test_time_stop_grace_for_legacy_positions(tmp_path) -> None:
         assert pos["status"] == "OPEN"
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_every_exit_writes_order_row(tmp_path) -> None:
+    """S5: Every exit (market close, time exit, phantom resolution) must write an order row to orders table."""
+    cfg = Settings(TRADING_MODE="live", BINANCE_API_KEY="k", BINANCE_API_SECRET="s", DB_PATH=str(tmp_path / "exit_orders.db"))
+    db = DatabaseManager(db_path=cfg.DB_PATH)
+    try:
+        db.open_position({
+            "position_id": "POS_TO_CLOSE",
+            "symbol": "BTC/USDT",
+            "entry_price": 50000.0,
+            "current_price": 51000.0,
+            "quantity": 0.01,
+            "cost_usd": 500.0,
+            "status": "OPEN",
+        })
+
+        class MarketCloseStub(StubCCXTClient):
+            async def fetch_balance(self):
+                return {"free": {"BTC": 0.01, "USDT": 1000.0}, "total": {"BTC": 0.01, "USDT": 1000.0}}
+
+            async def create_order(self, symbol, order_type, side, amount, price=None, params=None):
+                return {
+                    "id": "ord_close_99",
+                    "clientOrderId": (params or {}).get("newClientOrderId", "close_cid_99"),
+                    "symbol": symbol,
+                    "side": side,
+                    "type": order_type,
+                    "price": 51000.0,
+                    "average": 51000.0,
+                    "amount": amount,
+                    "filled": amount,
+                    "status": "closed",
+                }
+
+        stub = MarketCloseStub()
+        ex = BinanceExchangeWrapper(db=db, custom_settings=cfg, ccxt_client=stub)
+        from engine.risk_engine import RiskEngine
+        from engine.execution import ExecutionEngine
+        risk = RiskEngine(db=db, custom_settings=cfg)
+        execution = ExecutionEngine(exchange=ex, db=db, risk_engine=risk, custom_settings=cfg)
+
+        res = await execution.close_single_position_market("POS_TO_CLOSE", reason="MANUAL_TEST_CLOSE")
+        assert res["closed"] is True
+
+        # Check that orders table has an exit order row recorded
+        orders = db.get_open_orders()  # check orders in db
+        all_orders = db._conn.execute("SELECT * FROM orders WHERE symbol = 'BTC/USDT'").fetchall()
+        cols = [d[0] for d in db._conn.execute("SELECT * FROM orders").description]
+        order_dicts = [dict(zip(cols, r)) for r in all_orders]
+
+        assert len(order_dicts) >= 1
+        exit_order = next(o for o in order_dicts if o["side"] == "sell")
+        assert exit_order["order_type"].lower() == "market"
+        assert exit_order["filled"] == 0.01
+        assert exit_order["price"] == 51000.0
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_pnl_uses_actual_fills(tmp_path) -> None:
+    """S5: Exit computes realized PnL using real exchange fills and fee deductions."""
+    cfg = Settings(TRADING_MODE="live", BINANCE_API_KEY="k", BINANCE_API_SECRET="s", DB_PATH=str(tmp_path / "real_pnl.db"))
+    db = DatabaseManager(db_path=cfg.DB_PATH)
+    try:
+        db.open_position({
+            "position_id": "POS_REAL_FILLS",
+            "symbol": "ETH/USDT",
+            "entry_price": 3000.0,
+            "current_price": 3100.0,
+            "quantity": 1.0,
+            "cost_usd": 3000.0,
+            "status": "OPEN",
+        })
+
+        class TradeFillStub(StubCCXTClient):
+            async def fetch_balance(self):
+                return {"free": {"ETH": 1.0, "USDT": 1000.0}, "total": {"ETH": 1.0, "USDT": 1000.0}}
+
+            async def create_order(self, symbol, order_type, side, amount, price=None, params=None):
+                return {
+                    "id": "eth_close_1",
+                    "clientOrderId": "eth_cid_1",
+                    "symbol": symbol,
+                    "side": "sell",
+                    "type": "market",
+                    "price": 3100.0,
+                    "average": 3100.0,
+                    "amount": 1.0,
+                    "filled": 1.0,
+                    "fee": {"cost": 3.10, "currency": "USDT"},
+                    "status": "closed",
+                }
+
+            async def fetch_my_trades(self, symbol=None, since=None, limit=None):
+                return [
+                    {
+                        "id": "trade_eth_1",
+                        "order": "eth_close_1",
+                        "symbol": symbol,
+                        "side": "sell",
+                        "price": 3100.0,
+                        "amount": 1.0,
+                        "fee": {"cost": 3.10, "currency": "USDT"},
+                    }
+                ]
+
+        stub = TradeFillStub()
+        ex = BinanceExchangeWrapper(db=db, custom_settings=cfg, ccxt_client=stub)
+        from engine.risk_engine import RiskEngine
+        from engine.execution import ExecutionEngine
+        risk = RiskEngine(db=db, custom_settings=cfg)
+        execution = ExecutionEngine(exchange=ex, db=db, risk_engine=risk, custom_settings=cfg)
+
+        res = await execution.close_single_position_market("POS_REAL_FILLS", reason="TAKE_PROFIT_TEST")
+        assert res["closed"] is True
+
+        pos = db.get_position("POS_REAL_FILLS")
+        assert pos["status"] == "CLOSED"
+        assert pos["pnl_estimated"] is False
+        # Gross PnL = (3100 - 3000) * 1 = 100.0. Minus fee = ~96.90
+        assert 95.0 <= pos["realized_pnl_usd"] <= 100.0
+    finally:
+        db.close()
+
+
+def test_estimated_pnl_excluded_from_stats(tmp_path) -> None:
+    """S5: Positions marked pnl_estimated=True are excluded from daily realized PnL."""
+    cfg = Settings(TRADING_MODE="live", DB_PATH=str(tmp_path / "stats_pnl.db"))
+    db = DatabaseManager(db_path=cfg.DB_PATH)
+    try:
+        now_ms = int(time.time() * 1000)
+        # Position 1: Real fill, realized_pnl = 50.0, pnl_estimated = False
+        db.open_position({
+            "position_id": "REAL_POS",
+            "symbol": "BTC/USDT",
+            "entry_price": 50000.0,
+            "quantity": 0.01,
+            "cost_usd": 500.0,
+            "pnl_estimated": False,
+        })
+        db.close_position(position_id="REAL_POS", exit_price=55000.0, close_reason="TP", pnl_estimated=False)
+
+        # Position 2: Phantom / estimated, realized_pnl = 100.0, pnl_estimated = True
+        db.open_position({
+            "position_id": "EST_POS",
+            "symbol": "SOL/USDT",
+            "entry_price": 100.0,
+            "quantity": 1.0,
+            "cost_usd": 100.0,
+            "pnl_estimated": True,
+        })
+        db.close_position(position_id="EST_POS", exit_price=200.0, close_reason="PHANTOM_RESOLVED", pnl_estimated=True)
+
+        daily_pnl = db.get_daily_realized_pnl()
+        # Daily PnL must ONLY count the real fill (approx 49-50 USD), NOT the estimated 100 USD!
+        assert daily_pnl < 70.0
+    finally:
+        db.close()
+

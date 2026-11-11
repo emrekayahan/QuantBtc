@@ -607,6 +607,14 @@ class DatabaseManager:
             cols = [d[0] for d in cursor.description]
             return dict(zip(cols, row))
 
+    def get_open_orders(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM orders WHERE status = 'open' ORDER BY created_at_ms DESC"
+            )
+            cols = [d[0] for d in cursor.description]
+            return [dict(zip(cols, r)) for r in cursor.fetchall()]
+
     def open_position(self, pos: Dict[str, Any]) -> None:
         now_ms = int(time.time() * 1000)
         with self._lock:
@@ -690,6 +698,8 @@ class DatabaseManager:
         exit_price: float,
         close_reason: str = "STOP_LOSS_OR_MARKET",
         fee_pct: float = 0.002,
+        pnl_estimated: bool = False,
+        realized_pnl: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         now_ms = int(time.time() * 1000)
         with self._lock:
@@ -703,10 +713,14 @@ class DatabaseManager:
             pos = dict(zip(cols, row))
             entry_price = float(pos["entry_price"])
             qty = float(pos["quantity"])
-            gross_pnl = (float(exit_price) - entry_price) * qty
-            fees = (entry_price * qty + float(exit_price) * qty) * (fee_pct / 2.0)
-            realized_pnl = gross_pnl - fees
-            outcome = 1 if realized_pnl > 0.0 else 0
+
+            if realized_pnl is not None:
+                calc_pnl = float(realized_pnl)
+            else:
+                gross_pnl = (float(exit_price) - entry_price) * qty
+                fees = (entry_price * qty + float(exit_price) * qty) * (fee_pct / 2.0)
+                calc_pnl = gross_pnl - fees
+            outcome = 1 if calc_pnl > 0.0 else 0
 
             self._conn.execute(
                 """
@@ -716,10 +730,11 @@ class DatabaseManager:
                     unrealized_pnl_usd = 0.0,
                     realized_pnl_usd = ?,
                     closed_at_ms = ?,
-                    close_reason = ?
+                    close_reason = ?,
+                    pnl_estimated = ?
                 WHERE position_id = ?
                 """,
-                [float(exit_price), float(realized_pnl), now_ms, close_reason, position_id],
+                [float(exit_price), float(calc_pnl), now_ms, close_reason, bool(pnl_estimated), position_id],
             )
 
             # Also record binary outcome on matching reflex_decisions if present
@@ -851,7 +866,7 @@ class DatabaseManager:
                 """
                 SELECT COALESCE(SUM(realized_pnl_usd), 0.0)
                 FROM positions
-                WHERE status = 'CLOSED' AND closed_at_ms >= ?
+                WHERE status = 'CLOSED' AND closed_at_ms >= ? AND pnl_estimated IS NOT TRUE
                 """,
                 [start_of_day_ms],
             ).fetchone()

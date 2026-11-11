@@ -832,10 +832,28 @@ class ExecutionEngine:
         # In paper mode, do not send any close orders to Binance
         if target.get("is_paper") or getattr(self.cfg, "is_paper", True):
             exit_price = float(target.get("current_price") or target["entry_price"])
+            now_ms = int(time.time() * 1000)
+            self.db.upsert_order({
+                "client_order_id": f"PAPER_CLOSE_{position_id}_{now_ms}",
+                "exchange_order_id": None,
+                "symbol": symbol,
+                "side": "sell",
+                "order_type": "market",
+                "status": "closed",
+                "price": exit_price,
+                "stop_price": None,
+                "amount": qty,
+                "filled": qty,
+                "cost_usd": exit_price * qty,
+                "causal_timestamp_ms": now_ms,
+                "created_at_ms": now_ms,
+                "updated_at_ms": now_ms,
+            })
             closed_pos = self.db.close_position(
                 position_id=position_id,
                 exit_price=exit_price,
                 close_reason=reason,
+                pnl_estimated=False,
             )
             if self.telegram is not None and closed_pos:
                 asyncio.create_task(
@@ -923,13 +941,62 @@ class ExecutionEngine:
                     "reason": f"Market sell failed ({exc}); SL rearmed: {rearm_sl is not None}",
                 }
 
-        exit_price = float(
-            sell_order.get("average") or sell_order.get("price") or target["current_price"]
-        )
+        # S5: Compute realized PnL using real exchange fills and commissions
+        realized_pnl = None
+        pnl_estimated = False
+        matching_trades = []
+
+        if sell_order.get("id") and hasattr(self.exchange, "client") and hasattr(self.exchange.client, "fetch_my_trades"):
+            try:
+                trades = await self.exchange.client.fetch_my_trades(symbol, since=int(target.get("opened_at_ms") or 0))
+                matching_trades = [t for t in trades if str(t.get("order")) == str(sell_order["id"])]
+            except Exception as trade_exc:
+                logger.debug("Could not fetch trades for close order %s: %s", sell_order.get("id"), trade_exc)
+
+        if matching_trades:
+            total_amt = sum(float(t.get("amount") or 0.0) for t in matching_trades)
+            if total_amt > 0.0:
+                exit_price = sum(float(t.get("price") or 0.0) * float(t.get("amount") or 0.0) for t in matching_trades) / total_amt
+                fee_usd = sum(float((t.get("fee") or {}).get("cost") or 0.0) for t in matching_trades)
+                realized_pnl = (exit_price - float(target["entry_price"])) * qty - fee_usd
+                pnl_estimated = False
+        elif sell_order.get("average") or sell_order.get("price"):
+            exit_price = float(sell_order.get("average") or sell_order.get("price"))
+            fee_info = sell_order.get("fee") or {}
+            fee_usd = float(fee_info.get("cost") or 0.0)
+            if fee_usd > 0.0:
+                realized_pnl = (exit_price - float(target["entry_price"])) * qty - fee_usd
+            pnl_estimated = False
+        else:
+            exit_price = float(target.get("current_price") or target["entry_price"])
+            pnl_estimated = True
+
+        # S5: Record order row for exit
+        now_ms = int(time.time() * 1000)
+        exit_cid = str(sell_order.get("clientOrderId") or f"CLOSE_{position_id}_{now_ms}")
+        self.db.upsert_order({
+            "client_order_id": exit_cid,
+            "exchange_order_id": str(sell_order.get("id")) if sell_order.get("id") else None,
+            "symbol": symbol,
+            "side": "sell",
+            "order_type": str(sell_order.get("type") or "market").lower(),
+            "status": "closed",
+            "price": exit_price,
+            "stop_price": None,
+            "amount": qty,
+            "filled": float(sell_order.get("filled") or qty),
+            "cost_usd": exit_price * qty,
+            "causal_timestamp_ms": now_ms,
+            "created_at_ms": now_ms,
+            "updated_at_ms": now_ms,
+        })
+
         closed_pos = self.db.close_position(
             position_id=position_id,
             exit_price=exit_price,
             close_reason=reason,
+            pnl_estimated=pnl_estimated,
+            realized_pnl=realized_pnl,
         )
         if self.telegram is not None and closed_pos:
             asyncio.create_task(
