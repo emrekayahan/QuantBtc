@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import List, Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -47,13 +47,13 @@ class Settings(BaseSettings):
 
     # === RISK & CAPITAL GUARDRAILS ===
     TIMEFRAME: str = Field(default="15m")
-    MAX_OPEN_POSITIONS: int = Field(default=5, ge=1, le=20)
+    MAX_OPEN_POSITIONS: int = Field(default=2, ge=1, le=20)
     MAX_POSITION_USD: float = Field(default=25.0, gt=0.0)
     SPOT_MIN_POSITION_USD: float = Field(default=11.50, gt=0.0)
     FUTURES_MIN_USDT: float = Field(default=3.0, gt=0.0)
-    FUTURES_DEFAULT_LEVERAGE: int = Field(default=20, ge=1, le=50)
+    FUTURES_DEFAULT_LEVERAGE: int = Field(default=3, ge=1, le=50)
     FUTURES_MARGIN_USD: float = Field(default=4.50, gt=0.0)
-    DAILY_MAX_TRADES: int = Field(default=20, ge=1, le=100)
+    DAILY_MAX_TRADES: int = Field(default=6, ge=1, le=100)
     DAILY_MAX_LOSS_USD: float = Field(default=5.0, gt=0.0)
     MAX_DRAWDOWN_PCT: float = Field(default=15.0, gt=0.0, le=100.0)
     MIN_24H_VOLUME_USD: float = Field(default=10_000_000.0, gt=0.0)
@@ -62,12 +62,71 @@ class Settings(BaseSettings):
     MIN_SETUP_QUALITY: int = Field(default=2, ge=1, le=3)
     ROUND_TRIP_FEE_PCT: float = Field(default=0.20, ge=0.0, le=2.0)
 
+    # === T0: PAPER / LIVE MODE (safe default = paper) ===
+    TRADING_MODE: Literal["paper", "live"] = Field(default="paper")
+    PAPER_STARTING_USDT: float = Field(default=30.0, gt=0.0)
+    PAPER_PARTIAL_FILL_PROB: float = Field(default=0.0, ge=0.0, le=1.0)
+    SPOT_FEE_PCT: float = Field(default=0.10, ge=0.0, le=2.0)
+    FUTURES_FEE_PCT: float = Field(default=0.05, ge=0.0, le=2.0)
+
+    # === T1: UNPROTECTED-EXPOSURE GUARANTEES ===
+    ENTRY_ORDER_TTL_SEC: float = Field(default=90.0, ge=0.0, le=900.0)
+    ENTRY_ORDER_POLL_SEC: float = Field(default=2.0, ge=0.0, le=30.0)
+    DUST_MAX_USD: float = Field(default=0.50, ge=0.0)
+    SL_LIMIT_BUFFER_PCT: float = Field(default=0.20, ge=0.0, le=5.0)
+    SL_ESCALATION_SEC: float = Field(default=20.0, ge=1.0, le=300.0)
+
+    # === T3: LEVERAGE & EXPOSURE LIMITS (safe defaults) ===
+    ENABLE_FUTURES: bool = Field(default=False)
+    MAX_LEVERAGE: int = Field(default=3, ge=1, le=20)
+    MAX_GROSS_EXPOSURE_X: float = Field(default=1.0, gt=0.0, le=10.0)
+    MAX_RISK_PER_TRADE_PCT: float = Field(default=1.0, gt=0.0, le=10.0)
+    MAX_TOTAL_OPEN_RISK_PCT: float = Field(default=3.0, gt=0.0, le=30.0)
+    MAX_CORRELATED_LONGS: int = Field(default=2, ge=1, le=20)
+    FALLBACK_TO_SPOT_WHEN_FUTURES_EXHAUSTED: bool = Field(default=False)
+    SLIPPAGE_PCT: float = Field(default=0.05, ge=0.0, le=2.0)
+    SMALL_ACCOUNT_EQUITY_USD: float = Field(default=100.0, gt=0.0)
+    SMALL_ACCOUNT_MAX_RISK_PCT: float = Field(default=1.5, gt=0.0, le=10.0)
+    MIN_NOTIONAL_RISK_EXCEPTION_PCT: float = Field(default=3.0, gt=0.0, le=10.0)
+    MAX_MARGIN_PCT_PER_TRADE: float = Field(default=25.0, gt=0.0, le=100.0)
+    DAILY_MAX_LOSS_PCT: float = Field(default=3.0, gt=0.0, le=50.0)
+    LIQ_BUFFER_X: float = Field(default=2.0, ge=1.0, le=10.0)
+    MAX_HOLD_BARS: int = Field(default=32, ge=1, le=500)
+    MIN_BRIER_SAMPLES: int = Field(default=30, ge=5, le=500)
+    MIN_LESSONS_FOR_PENALTY: int = Field(default=8, ge=1, le=100)
+    SIGNAL_HORIZON_BARS: int = Field(default=32, ge=1, le=500)
+    BB_TOUCH_TOL: float = Field(default=0.002, ge=0.0, le=0.1)
+    MOMENTUM_MIN_ATR_FRAC: float = Field(default=0.3, ge=0.0, le=5.0)
+    ADX_MIN: float = Field(default=20.0, ge=0.0, le=100.0)
+    BLOCK_LONGS_BELOW_BTC_EMA200: bool = Field(default=True)
+    MAX_FUNDING_PCT: float = Field(default=0.05, ge=0.0, le=5.0)
+    CLOCK_WARN_MS: int = Field(default=250, ge=10, le=5000)
+    CLOCK_BLOCK_MS: int = Field(default=800, ge=50, le=10000)
+
+    # === T5: AUTONOMY & MONITORING (R17-R18) ===
+    AUTONOMY_START_LEVEL: int = Field(default=0, ge=0, le=3)
+    FUTURES_MIN_LEVEL: int = Field(default=1, ge=0, le=3)
+    SAFE_MODE_ENABLED: bool = Field(default=True)
+    WATCHDOG_TIMEOUT_SEC: float = Field(default=120.0, ge=30.0, le=600.0)
+
+    # === T4: SAFE SHUTDOWN ===
+    SHUTDOWN_GRACE_SEC: float = Field(default=45.0, ge=1.0, le=85.0)
+
     # === STORAGE, LOGS & DASHBOARD ===
-    DASHBOARD_HOST: str = Field(default="0.0.0.0")
+    DASHBOARD_HOST: str = Field(default="127.0.0.1")
     DASHBOARD_PORT: int = Field(default=8000, ge=1024, le=65535)
-    DB_PATH: str = Field(default=str(BASE_DIR / "data" / "quant_bot.db"))
+    DB_PATH: str = Field(default="")
     LOG_DIR: str = Field(default=str(BASE_DIR / "logs"))
     TOP_WATCHLIST_SIZE: int = Field(default=20, ge=5, le=50)
+
+    @property
+    def effective_db_path(self) -> str:
+        """Return dedicated DB path separated by trading mode."""
+        if self.DB_PATH.strip():
+            return self.DB_PATH
+        mode = str(self.TRADING_MODE).lower()
+        suffix = "live" if mode == "live" else "paper"
+        return str(BASE_DIR / "data" / f"quant_bot_{suffix}.db")
 
     @field_validator("TIMEFRAME")
     @classmethod
@@ -98,6 +157,16 @@ class Settings(BaseSettings):
         """Return parsed list of fallback OpenRouter model identifiers."""
         models = [m.strip() for m in self.OPENROUTER_MODELS.split(",") if m.strip()]
         return models or ["deepseek/deepseek-r1:free"]
+
+    @property
+    def is_paper(self) -> bool:
+        """True when no real orders may be sent to the exchange."""
+        return str(self.TRADING_MODE).lower() != "live"
+
+    @property
+    def effective_leverage(self) -> int:
+        """Futures leverage hard-capped by MAX_LEVERAGE."""
+        return max(1, min(int(self.FUTURES_DEFAULT_LEVERAGE), int(self.MAX_LEVERAGE)))
 
     @property
     def has_valid_binance_keys(self) -> bool:

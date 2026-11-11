@@ -127,7 +127,8 @@ class OpenRouterPool:
                             data = resp.json()
                             choices = data.get("choices") or []
                             msg_obj = choices[0].get("message", {}) if choices else {}
-                            raw_text = msg_obj.get("content") or msg_obj.get("reasoning")
+                            # Strictly read final 'content' field; never fall back to internal 'reasoning' CoT leak
+                            raw_text = msg_obj.get("content")
                             if raw_text and str(raw_text).strip():
                                 content = str(raw_text).strip()
                                 telemetry["status"] = "healthy"

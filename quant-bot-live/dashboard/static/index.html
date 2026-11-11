@@ -394,18 +394,18 @@
       if (!confirm("CRITICAL CONFIRMATION: Cancel all open Binance orders, market-sell all open positions, and HALT the engine?")) {
         return;
       }
-      await fetch("/api/kill-switch", { method: "POST" });
+      await fetch("/api/kill-switch", { method: "POST", headers: { "X-Confirm": "true" } });
       await fetchTelemetry();
     }
 
     async function resumeSystem() {
-      await fetch("/api/resume", { method: "POST" });
+      await fetch("/api/resume", { method: "POST", headers: { "X-Confirm": "true" } });
       await fetchTelemetry();
     }
 
     async function closeSinglePosition(positionId) {
       if (!confirm(`Market-sell and close position ${positionId} immediately?`)) return;
-      await fetch(`/api/positions/${encodeURIComponent(positionId)}/close`, { method: "POST" });
+      await fetch(`/api/positions/${encodeURIComponent(positionId)}/close`, { method: "POST", headers: { "X-Confirm": "true" } });
       await fetchTelemetry();
       await loadChart(currentSymbol);
     }

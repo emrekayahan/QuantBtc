@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from config.settings import Settings
 from database.db_manager import DatabaseManager
 from engine.risk_engine import RiskEngine
 from engine.schemas import ReflexDecisionSchema
@@ -62,8 +63,10 @@ def test_quarter_kelly_strictly_capped_at_025_and_max_position_usd(tmp_path) -> 
         gate_small = risk.evaluate_gate(dec, free_usdt=9.0, min_notional_usd=10.0)
         assert gate_small["approved"] is False
 
-        # When Futures wallet has >= $5.0 USDT, auto-detects FUTURES Isolated mode
-        gate_fut = risk.evaluate_gate(
+        # When Futures wallet has >= $5.0 USDT, auto-detects FUTURES Isolated mode (if enabled in settings)
+        fut_cfg = Settings(ENABLE_FUTURES=True, FUTURES_DEFAULT_LEVERAGE=3)
+        risk_fut = RiskEngine(db=db, custom_settings=fut_cfg)
+        gate_fut = risk_fut.evaluate_gate(
             dec, free_usdt=30.59, min_notional_usd=10.0, futures_free_usdt=10.0
         )
         assert gate_fut["approved"] is True

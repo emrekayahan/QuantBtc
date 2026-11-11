@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 from config.settings import Settings, settings
 from database.db_manager import DatabaseManager
 from engine.exchange import BinanceExchangeWrapper
+from engine.risk_sizer import RiskSizer
 from engine.schemas import ReflexDecisionSchema
 
 logger = logging.getLogger(__name__)
@@ -72,14 +73,11 @@ class RiskEngine:
         trading_mode: str = "SPOT",
         futures_free_usdt: float = 0.0,
     ) -> Dict[str, Any]:
-        """
-        Compute position size in USD for either SPOT or FUTURES (2x-3x Isolated):
-        - If FUTURES mode (`futures_free_usdt >= 5.0` or `trading_mode == 'FUTURES'`):
-          Use ~$4-$5 margin at 2x-3x leverage.
-        - If SPOT mode (`futures_free_usdt < 5.0`):
-          Enforce `max(kelly_usd_size, 11.50)` when `free_usdt >= 11.50` so orders with $30.59 balance
-          always clear Binance's $5-$10 MIN_NOTIONAL filter cleanly.
-        """
+        """Compute exact risk-based position size, margin, and leverage using RiskSizer."""
+        raw_eq = float(self.db.get_state("total_equity_usd", "0.0") or 0.0)
+        equity = max(raw_eq, float(free_usdt), float(getattr(self.cfg, "PAPER_STARTING_USDT", 30.0)))
+        open_positions = self.db.get_open_positions()
+
         stop_dist_pct = abs(decision.entry_price - decision.invalidation_price) / max(
             decision.entry_price, 1e-9
         )
@@ -89,75 +87,19 @@ class RiskEngine:
             round_trip_fee_pct=self.cfg.ROUND_TRIP_FEE_PCT,
             stop_distance_pct=stop_dist_pct,
         )
-        max_pos_usd = self.get_active_max_position_usd()
-        futures_min = float(getattr(self.cfg, "FUTURES_MIN_USDT", 5.0))
-        is_futures = trading_mode.upper().startswith("FUTURE") or float(futures_free_usdt) >= futures_min
 
-        if f_quarter <= 0.0:
-            return {
-                "approved": False,
-                "f_quarter": f_quarter,
-                "position_usd": 0.0,
-                "trading_mode": "FUTURES" if is_futures else "SPOT",
-                "leverage": 1,
-                "reason": "Quarter-Kelly fraction is 0.0 (negative edge).",
-            }
-
-        if is_futures:
-            avail_fut = float(futures_free_usdt) if float(futures_free_usdt) >= futures_min else float(free_usdt)
-            if avail_fut < futures_min:
-                return {
-                    "approved": False,
-                    "f_quarter": f_quarter,
-                    "position_usd": 0.0,
-                    "trading_mode": "FUTURES",
-                    "leverage": int(getattr(self.cfg, "FUTURES_DEFAULT_LEVERAGE", 20)),
-                    "reason": f"Futures free USDT ({avail_fut:.2f}) < {futures_min:.2f}",
-                }
-            leverage = int(getattr(self.cfg, "FUTURES_DEFAULT_LEVERAGE", 20))
-            base_margin = float(getattr(self.cfg, "FUTURES_MARGIN_USD", 4.50))
-            margin_usd = min(avail_fut * 0.85, max(2.5, base_margin))
-            target_usd = round(margin_usd * leverage, 2)
-            return {
-                "approved": True,
-                "f_quarter": f_quarter,
-                "position_usd": round(target_usd, 2),
-                "margin_usd": round(margin_usd, 2),
-                "trading_mode": "FUTURES",
-                "leverage": leverage,
-                "reason": f"Futures {leverage}x Isolated sizing valid (margin=${margin_usd:.2f}, notional=${target_usd:.2f}).",
-            }
-
-        # SPOT MODE: Enforce minimum position size max(kelly_usd_size, 11.50) when free_usdt >= 11.50
-        spot_min_pos = float(getattr(self.cfg, "SPOT_MIN_POSITION_USD", 11.50))
-        min_required_usd = max(float(min_notional_usd) * 1.10, spot_min_pos)
-        kelly_usd_size = float(free_usdt) * f_quarter
-
-        if float(free_usdt) >= min_required_usd:
-            target_usd = min(max(kelly_usd_size, spot_min_pos), max_pos_usd, float(free_usdt) * 0.98)
-        else:
-            target_usd = min(kelly_usd_size, max_pos_usd)
-
-        if target_usd < float(min_notional_usd) * 1.10:
-            return {
-                "approved": False,
-                "f_quarter": f_quarter,
-                "position_usd": 0.0,
-                "trading_mode": "SPOT",
-                "leverage": 1,
-                "reason": (
-                    f"Target USD ({target_usd:.2f}) below minNotional*1.10 ({float(min_notional_usd) * 1.10:.2f})"
-                ),
-            }
-
-        return {
-            "approved": True,
-            "f_quarter": f_quarter,
-            "position_usd": round(target_usd, 2),
-            "trading_mode": "SPOT",
-            "leverage": 1,
-            "reason": "Spot Quarter-Kelly sizing valid.",
-        }
+        return RiskSizer.calculate(
+            equity=equity,
+            entry_price=float(decision.entry_price),
+            invalidation_price=float(decision.invalidation_price),
+            min_notional=float(min_notional_usd),
+            trading_mode=trading_mode,
+            free_usdt=float(free_usdt),
+            futures_free_usdt=float(futures_free_usdt),
+            open_positions=open_positions,
+            cfg=self.cfg,
+            f_quarter=f_quarter,
+        )
 
     def evaluate_gate(
         self,
@@ -175,11 +117,28 @@ class RiskEngine:
         - decision.risk_state == 'safe' and decision.toxic_flow == 'none'
         - decision.regime != 'crisis'
         - open_positions < settings.MAX_OPEN_POSITIONS
-        - daily_trades_count < settings.DAILY_MAX_TRADES (max 2 trades/day)
+        - daily_trades_count < settings.DAILY_MAX_TRADES
+        - Dynamic daily max loss (DAILY_MAX_LOSS_PCT)
+        - Max drawdown (MAX_DRAWDOWN_PCT)
         - system_halted == False
+        - RiskSizer constraints (gross exposure with incoming trade, total open risk, liq buffer)
         """
         if self.db.is_system_halted():
             return {"approved": False, "position_usd": 0.0, "reason": "System is HALTED."}
+
+        if self.db.is_safe_mode():
+            return {
+                "approved": False,
+                "position_usd": 0.0,
+                "reason": f"System is in SAFE MODE ({self.db.get_state('safe_mode_reason', 'Active anomaly')}); new entries blocked.",
+            }
+
+        if self.db.get_state("entries_blocked", "false") == "true":
+            return {
+                "approved": False,
+                "position_usd": 0.0,
+                "reason": "Entries are temporarily blocked due to active reconciliation violation.",
+            }
 
         if self.db.is_symbol_paused(decision.symbol):
             return {
@@ -188,10 +147,10 @@ class RiskEngine:
                 "reason": f"Symbol {decision.symbol} is temporarily paused.",
             }
 
-        # Strict Daily Trade Cap (Max 2 Trades/Day)
+        # Daily Trade Cap
         if hasattr(self.db, "get_daily_trades_count"):
             daily_trades = self.db.get_daily_trades_count()
-            max_daily_trades = int(getattr(self.cfg, "DAILY_MAX_TRADES", 2))
+            max_daily_trades = int(getattr(self.cfg, "DAILY_MAX_TRADES", 6))
             if daily_trades >= max_daily_trades:
                 return {
                     "approved": False,
@@ -199,10 +158,19 @@ class RiskEngine:
                     "reason": f"Daily trade cap reached ({daily_trades}/{max_daily_trades} trades today).",
                 }
 
+        # Dynamic Daily Max Loss
+        raw_eq = float(self.db.get_state("total_equity_usd", "0.0") or 0.0)
+        equity = max(raw_eq, float(free_usdt), float(getattr(self.cfg, "PAPER_STARTING_USDT", 30.0)))
+        is_small = equity < float(getattr(self.cfg, "SMALL_ACCOUNT_EQUITY_USD", 100.0))
+        daily_loss_pct = float(getattr(self.cfg, "DAILY_MAX_LOSS_PCT", 3.0))
+        if is_small:
+            daily_loss_pct = max(daily_loss_pct, 5.0)
+        effective_daily_max_loss = min(float(self.cfg.DAILY_MAX_LOSS_USD), equity * (daily_loss_pct / 100.0))
+
         daily_pnl = self.db.get_daily_realized_pnl()
-        if daily_pnl <= -abs(float(self.cfg.DAILY_MAX_LOSS_USD)):
+        if daily_pnl <= -abs(effective_daily_max_loss):
             self.db.set_system_halted(
-                True, reason=f"Daily max loss limit hit ({daily_pnl:.2f} USD)"
+                True, reason=f"Daily max loss limit hit ({daily_pnl:.2f} USD <= -{effective_daily_max_loss:.2f} USD)"
             )
             return {
                 "approved": False,
@@ -221,12 +189,14 @@ class RiskEngine:
                 "reason": f"Max drawdown limit reached ({drawdown_pct:.2f}%).",
             }
 
+        # Open positions & Correlated longs check
         open_positions = self.db.get_open_positions()
-        if len(open_positions) >= int(self.cfg.MAX_OPEN_POSITIONS):
+        max_longs = min(int(self.cfg.MAX_OPEN_POSITIONS), int(getattr(self.cfg, "MAX_CORRELATED_LONGS", 2)))
+        if len(open_positions) >= max_longs:
             return {
                 "approved": False,
                 "position_usd": 0.0,
-                "reason": f"Open positions ({len(open_positions)}) >= MAX_OPEN_POSITIONS ({self.cfg.MAX_OPEN_POSITIONS}).",
+                "reason": f"Correlated longs cap reached ({len(open_positions)}/{max_longs}).",
             }
 
         if any(p["symbol"] == decision.symbol for p in open_positions):
@@ -275,6 +245,12 @@ class RiskEngine:
                 "reason": f"Toxic flow detected: {decision.toxic_flow}.",
             }
 
+        # Auto-detect Dual Wallet mode: switch to FUTURES if enabled and balance sufficient
+        if trading_mode.upper() == "SPOT" and getattr(self.cfg, "ENABLE_FUTURES", False):
+            futures_min = float(getattr(self.cfg, "FUTURES_MIN_USDT", 5.0))
+            if float(futures_free_usdt) >= futures_min:
+                trading_mode = "FUTURES"
+
         sizing = self.compute_position_size_usd(
             decision=decision,
             free_usdt=free_usdt,
@@ -288,8 +264,8 @@ class RiskEngine:
         """
         Armed Emergency Kill-Switch:
         1. Set system_halted = True in DuckDB immediately.
-        2. Cancel all open orders on Binance for open positions.
-        3. Market-sell all open positions on Binance.
+        2. In paper mode: cleanly close all paper positions in DB without exchange calls.
+        3. In live mode: cancel open orders & market-sell both Spot and Futures positions.
         """
         self.db.set_system_halted(True, reason=reason)
         open_positions = self.db.get_open_positions()
@@ -297,42 +273,71 @@ class RiskEngine:
         flattened_positions = 0
         errors: list[str] = []
 
+        is_paper = getattr(self.cfg, "is_paper", True)
+
         for pos in open_positions:
             symbol = pos["symbol"]
             pos_id = pos["position_id"]
             qty = float(pos["quantity"])
-            try:
-                if self.exchange is not None:
-                    cancelled = await self.exchange.cancel_all_orders(symbol)
-                    cancelled_orders += len(cancelled or [])
+            m_type = str(pos.get("market_type", "spot")).lower()
 
-                    # Check live free balance for symbol base asset if possible
-                    base_asset = symbol.split("/")[0]
-                    try:
-                        bal = await self.exchange.fetch_balance()
-                        free_token = float(bal.get("free", {}).get(base_asset, qty) or qty)
-                        sell_qty = min(qty, free_token) if free_token > 0 else qty
-                    except Exception:
-                        sell_qty = qty
-
-                    if sell_qty > 0:
-                        sell_order = await self.exchange.create_market_sell_order(symbol, sell_qty)
-                        exit_price = float(
-                            sell_order.get("average")
-                            or sell_order.get("price")
-                            or pos["current_price"]
-                        )
-                    else:
-                        exit_price = float(pos["current_price"])
-                else:
-                    exit_price = float(pos["current_price"])
-
+            if is_paper or pos.get("is_paper"):
+                # Clean paper close without calling exchange
+                exit_price = float(pos.get("current_price") or pos["entry_price"])
                 self.db.close_position(
                     position_id=pos_id,
                     exit_price=exit_price,
-                    close_reason=f"KILL_SWITCH: {reason}",
+                    close_reason=f"KILL_SWITCH_PAPER: {reason}",
                 )
                 flattened_positions += 1
+                continue
+
+            try:
+                if self.exchange is not None:
+                    # Futures position handling
+                    if m_type == "futures" and getattr(self.exchange, "futures_client", None) is not None:
+                        fut_sym = self.exchange.resolve_futures_symbol(symbol)
+                        sl_oid = pos.get("sl_exchange_order_id")
+                        if sl_oid:
+                            try:
+                                await self.exchange.futures_client.cancel_order(str(sl_oid), fut_sym, params={"stop": True})
+                                cancelled_orders += 1
+                            except Exception:
+                                pass
+                        # Market sell with reduceOnly=True
+                        sell_order = await self.exchange.create_futures_order(
+                            symbol=symbol,
+                            order_type="market",
+                            side="sell",
+                            amount=qty,
+                            price=None,
+                            params={"reduceOnly": True},
+                        )
+                        exit_price = float(sell_order.get("average") or sell_order.get("price") or pos["current_price"])
+                    else:
+                        # Spot position handling
+                        cancelled = await self.exchange.cancel_all_orders(symbol)
+                        cancelled_orders += len(cancelled or [])
+                        base_asset = symbol.split("/")[0]
+                        try:
+                            bal = await self.exchange.fetch_balance()
+                            free_token = float(bal.get("free", {}).get(base_asset, qty) or qty)
+                            sell_qty = min(qty, free_token) if free_token > 0 else qty
+                        except Exception:
+                            sell_qty = qty
+
+                        if sell_qty > 0:
+                            sell_order = await self.exchange.create_market_sell_order(symbol, sell_qty)
+                            exit_price = float(sell_order.get("average") or sell_order.get("price") or pos["current_price"])
+                        else:
+                            exit_price = float(pos["current_price"])
+
+                    self.db.close_position(
+                        position_id=pos_id,
+                        exit_price=exit_price,
+                        close_reason=f"KILL_SWITCH_LIVE: {reason}",
+                    )
+                    flattened_positions += 1
             except Exception as exc:
                 err_msg = f"Failed to flatten {symbol}: {exc}"
                 logger.error(err_msg)

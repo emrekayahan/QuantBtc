@@ -16,6 +16,11 @@ from database.db_manager import DatabaseManager
 logger = logging.getLogger(__name__)
 
 
+class PaperModeViolation(RuntimeError):
+    """Raised when an attempt is made to execute a write operation to the exchange while in paper mode."""
+    pass
+
+
 class BinanceExchangeWrapper:
     """Production async CCXT Binance Spot wrapper."""
 
@@ -71,6 +76,13 @@ class BinanceExchangeWrapper:
                 futures_config["secret"] = self.cfg.BINANCE_API_SECRET
             self.futures_client = ccxt.binance(futures_config)
         self._futures_markets_loaded = False
+
+    def _assert_live_or_raise(self, action: str) -> None:
+        """Central gate ensuring no write command is ever sent to exchange in paper mode."""
+        if getattr(self.cfg, "is_paper", True):
+            msg = f"CRITICAL: Attempted exchange write action '{action}' while TRADING_MODE is paper!"
+            logger.critical(msg)
+            raise PaperModeViolation(msg)
 
     async def _with_backoff(self, coro_factory: Callable[[], Any], max_retries: int = 3, clear_auth_banner: bool = False) -> Any:
         delay = 0.5
@@ -138,6 +150,11 @@ class BinanceExchangeWrapper:
         local_before = int(time.time() * 1000)
         server_time = await self._with_backoff(lambda: self.client.fetch_time())
         local_after = int(time.time() * 1000)
+        # If first call included cold DNS/TLS handshake (>120ms), take a warm measurement
+        if (local_after - local_before) > 120:
+            local_before = int(time.time() * 1000)
+            server_time = await self._with_backoff(lambda: self.client.fetch_time())
+            local_after = int(time.time() * 1000)
         local_mid = (local_before + local_after) // 2
         drift_ms = int(server_time) - local_mid
         if self.db is not None:
@@ -245,6 +262,7 @@ class BinanceExchangeWrapper:
         if self.db is not None:
             self.db.set_state("spot_free_usdt", f"{spot_free:.2f}")
             self.db.set_state("futures_free_usdt", f"{fut_free:.2f}")
+            self.db.set_state("futures_total_usdt", f"{fut_total:.2f}")
             self.db.set_state("active_trading_mode", active_mode)
             self.db.set_state("futures_api_enabled", "true" if enable_futures_perm else "false")
 
@@ -309,6 +327,7 @@ class BinanceExchangeWrapper:
 
     async def configure_futures_isolated(self, symbol: str, leverage: int = 20) -> int:
         """Configure ISOLATED margin mode and target leverage (with automatic bracket fallback) for USD-M Futures."""
+        self._assert_live_or_raise("configure_futures_isolated")
         if self.futures_client is None:
             return leverage
         await self.ensure_futures_markets_loaded()
@@ -335,6 +354,7 @@ class BinanceExchangeWrapper:
         params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Place an order on USD-M Futures when FUTURES mode is active."""
+        self._assert_live_or_raise(f"create_futures_order({symbol}, {order_type}, {side})")
         if self.futures_client is None:
             raise RuntimeError("Futures client is not initialized")
         await self.ensure_futures_markets_loaded()
@@ -444,6 +464,7 @@ class BinanceExchangeWrapper:
         price: Optional[float] = None,
         params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        self._assert_live_or_raise(f"create_order({symbol}, {order_type}, {side})")
         await self.ensure_markets_loaded()
         fmt_amount = self.amount_to_precision(symbol, amount)
         fmt_price = self.price_to_precision(symbol, price) if price is not None else None
@@ -460,6 +481,7 @@ class BinanceExchangeWrapper:
     async def create_market_sell_order(
         self, symbol: str, amount: float, params: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
+        self._assert_live_or_raise(f"create_market_sell_order({symbol})")
         await self.ensure_markets_loaded()
         fmt_amount = self.amount_to_precision(symbol, amount)
         return await self._with_backoff(
@@ -467,9 +489,11 @@ class BinanceExchangeWrapper:
         )
 
     async def cancel_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
+        self._assert_live_or_raise(f"cancel_order({order_id}, {symbol})")
         return await self._with_backoff(lambda: self.client.cancel_order(order_id, symbol))
 
     async def cancel_all_orders(self, symbol: str) -> Any:
+        self._assert_live_or_raise(f"cancel_all_orders({symbol})")
         open_orders = await self.fetch_open_orders(symbol)
         cancelled = []
         for o in open_orders:

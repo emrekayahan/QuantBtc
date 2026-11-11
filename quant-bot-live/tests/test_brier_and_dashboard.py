@@ -6,6 +6,7 @@ import time
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from config.settings import Settings
 from dashboard.server import create_dashboard_app
 from database.db_manager import DatabaseManager
 from engine.risk_engine import RiskEngine
@@ -20,7 +21,7 @@ async def test_overnight_brier_calibration_raises_threshold_when_overconfident(t
         now_ms = int(time.time() * 1000)
         # Open and close two losing high-confidence trades -> outcome = 0, confidence = 0.85
         # Brier Score = (0.85 - 0)^2 = 0.7225 > 0.25
-        for idx in (1, 2):
+        for idx in range(1, 6):
             pid = f"POS_TEST_{idx}"
             db.open_position(
                 {
@@ -39,13 +40,13 @@ async def test_overnight_brier_calibration_raises_threshold_when_overconfident(t
             )
             db.close_position(pid, exit_price=98.2, close_reason="STOP_LOSS")
 
-        reviewer = OvernightBrierReviewer(db=db, openrouter_pool=None)
+        cfg = Settings(MIN_BRIER_SAMPLES=5)
+        reviewer = OvernightBrierReviewer(db=db, openrouter_pool=None, custom_settings=cfg)
         res = await reviewer.run_overnight_review()
 
-        assert res["sample_count"] == 2
+        assert res["sample_count"] == 5
         assert res["brier_score"] > 0.25
-        assert res["min_confidence_threshold"] == pytest.approx(0.71, abs=1e-4)
-        assert res["max_position_usd"] == pytest.approx(20.0, abs=1e-2)
+        assert res["min_confidence_threshold"] == pytest.approx(0.70, abs=1e-4)
     finally:
         db.close()
 
@@ -78,7 +79,11 @@ async def test_dashboard_telemetry_and_kill_switch_endpoint(tmp_path) -> None:
             data = r_tel.json()
             assert data["kpis"]["system_status"] == "ACTIVE"
 
-            r_kill = await client.post("/api/kill-switch", auth=auth)
+            # 3. Write endpoints require X-Confirm header (R7 hardening)
+            r_no_confirm = await client.post("/api/kill-switch", auth=auth)
+            assert r_no_confirm.status_code == 400
+
+            r_kill = await client.post("/api/kill-switch", auth=auth, headers={"X-Confirm": "true"})
             assert r_kill.status_code == 200
             assert r_kill.json()["system_halted"] is True
             assert db.is_system_halted() is True

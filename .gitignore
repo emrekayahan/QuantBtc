@@ -36,3 +36,9 @@ quant-bot-live/data/
 quant-bot-live/logs/
 data/
 logs/
+
+# Exported live reports (contain balances / runtime data)
+rapor/*.log
+rapor/*.csv
+rapor/*.txt
+*.duckdb

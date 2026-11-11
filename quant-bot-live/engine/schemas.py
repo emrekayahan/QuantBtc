@@ -66,3 +66,5 @@ class ReflexDecisionSchema(BaseModel):
     take_profit_price: float = Field(gt=0.0)
     expected_reward_risk_ratio: float = Field(gt=0.0)
     rationale: str
+    strategy_id: str = Field(default="default")
+    side: DirectionLiteral = Field(default="long")

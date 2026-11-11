@@ -61,19 +61,30 @@ class DecisionReflexScorer:
             risk_state = "safe"
 
         direction: DirectionLiteral = "neutral"
+        strategy_id: str = "default"
         setup_quality: int = 0
         confidence: float = 0.25
         reasons: list[str] = []
 
-        # Crisis or toxic flow blocks bullish setups
+        # R14 Check: BLOCK_LONGS_BELOW_BTC_EMA200
+        block_longs_below_btc = getattr(self.cfg, "BLOCK_LONGS_BELOW_BTC_EMA200", True)
+        btc_below_ema200 = False
+        if self.db is not None:
+            btc_macro = str(self.db.get_state("btc_below_ema200", "false")).lower() in ("true", "1")
+            if btc_macro:
+                btc_below_ema200 = True
+
+        bb_touch_tol = float(getattr(self.cfg, "BB_TOUCH_TOL", 0.002))
+        mom_min_atr_frac = float(getattr(self.cfg, "MOMENTUM_MIN_ATR_FRAC", 0.3))
+        adx_min = float(getattr(self.cfg, "ADX_MIN", 20.0))
+
+        # Crisis or toxic flow blocks setups
         if state.regime == "crisis":
-            reasons.append("Macro crisis regime active; all long entries blocked.")
+            reasons.append("Macro crisis regime active; all entries blocked.")
         elif state.toxic_flow != "none":
             reasons.append(f"Toxic orderflow detected ({state.toxic_flow}); standing down.")
         elif state.regime == "trending":
             # Sub-Strategy 1: Trend Momentum (regime == 'trending')
-            # Spec: Price > EMA(200), EMA(9) > EMA(21), 48 <= RSI(14) <= 68,
-            # Volume > 1.2 * SMA(Vol, 20), and orderbook_imbalance > -0.15
             cond_macro_up = state.closed_close > state.ema_200
             cond_ema_cross = state.ema_9 > state.ema_21
             cond_rsi_band = 48.0 <= state.rsi_14 <= 68.0
@@ -83,32 +94,37 @@ class DecisionReflexScorer:
             passed = sum([cond_macro_up, cond_ema_cross, cond_rsi_band, cond_vol_surge, cond_ob_support])
 
             if cond_macro_up and cond_ema_cross and cond_rsi_band and cond_vol_surge and cond_ob_support:
-                direction = "long"
-                # Bonus quality check: strong ADX and positive orderbook imbalance + EMA50 alignment
-                if state.closed_close > state.ema_50 and state.orderbook_imbalance >= 0.05 and state.adx_14 >= 25.0:
-                    setup_quality = 3
-                    confidence = min(
-                        0.95,
-                        0.85
-                        + min(0.05, max(0.0, state.orderbook_imbalance) * 0.10)
-                        + min(0.05, max(0.0, (state.adx_14 - 25.0) / 200.0)),
-                    )
+                if block_longs_below_btc and btc_below_ema200:
+                    reasons.append("Long entry blocked: BTC is below its EMA200.")
                 else:
-                    setup_quality = 2
-                    confidence = min(
-                        0.92,
-                        0.82 + min(0.06, max(0.0, state.orderbook_imbalance) * 0.10),
+                    direction = "long"
+                    strategy_id = "trend_momentum"
+                    if state.closed_close > state.ema_50 and state.orderbook_imbalance >= 0.05 and state.adx_14 >= 25.0:
+                        setup_quality = 3
+                        confidence = min(
+                            0.95,
+                            0.85
+                            + min(0.05, max(0.0, state.orderbook_imbalance) * 0.10)
+                            + min(0.05, max(0.0, (state.adx_14 - 25.0) / 200.0)),
+                        )
+                    else:
+                        setup_quality = 2
+                        confidence = min(
+                            0.92,
+                            0.82 + min(0.06, max(0.0, state.orderbook_imbalance) * 0.10),
+                        )
+                    reasons.append(
+                        f"Trend Momentum Long: Close({state.closed_close:.4f})>EMA200({state.ema_200:.4f}), "
+                        f"EMA9>EMA21, RSI={state.rsi_14:.1f}, Vol={state.closed_volume / max(state.vol_sma_20, 1e-9):.2f}x, "
+                        f"OB_Imb={state.orderbook_imbalance:+.2f}"
                     )
-                reasons.append(
-                    f"Trend Momentum Long: Close({state.closed_close:.4f})>EMA200({state.ema_200:.4f}), "
-                    f"EMA9>EMA21, RSI={state.rsi_14:.1f}, Vol={state.closed_volume / max(state.vol_sma_20, 1e-9):.2f}x, "
-                    f"OB_Imb={state.orderbook_imbalance:+.2f}"
-                )
             elif passed >= 3 and cond_macro_up:
-                direction = "long"
-                setup_quality = 1
-                confidence = 0.62
-                reasons.append(f"Partial Trend setup ({passed}/5 conditions met); below execution threshold.")
+                if not (block_longs_below_btc and btc_below_ema200):
+                    direction = "long"
+                    strategy_id = "trend_momentum"
+                    setup_quality = 1
+                    confidence = 0.62
+                    reasons.append(f"Partial Trend setup ({passed}/5 conditions met); below execution threshold.")
             else:
                 reasons.append(f"No Trend setup ({passed}/5 conditions met).")
 
@@ -121,59 +137,71 @@ class DecisionReflexScorer:
                 or state.rsi_14 > state.prev_rsi_14
                 or (lower_wick / candle_range) >= 0.30
             )
-            cond_bb_support = (
-                state.closed_low <= state.bb_lower * 1.015
-                or state.closed_close <= state.bb_lower * 1.018
+            # R14: Strict BB dip condition (low <= bb_lower * (1 + BB_TOUCH_TOL))
+            cond_bb_support = state.closed_low <= state.bb_lower * (1.0 + bb_touch_tol)
+            cond_rsi_oversold = state.rsi_14 < 30.0 or (
+                state.rsi_14 < 32.0 and state.rsi_14 > state.prev_rsi_14 and cond_bb_support
             )
-            cond_rsi_oversold = state.rsi_14 < 36.0 or (
-                state.rsi_14 < 39.5 and state.rsi_14 > state.prev_rsi_14
-            )
+            # R14: Strict momentum bounce: (close - ema21) >= MOMENTUM_MIN_ATR_FRAC * ATR, ADX >= ADX_MIN
             cond_intraday_momentum = (
-                state.closed_close > state.ema_21
-                and state.ema_9 >= state.ema_21 * 0.998
-                and 42.0 <= state.rsi_14 <= 66.0
+                (state.closed_close - state.ema_21) >= (mom_min_atr_frac * state.atr_14)
+                and state.adx_14 >= adx_min
+                and state.ema_9 > state.ema_21
+                and 50.0 <= state.rsi_14 <= 65.0
                 and state.closed_close > state.closed_open
-                and state.rsi_14 >= state.prev_rsi_14
+                and state.rsi_14 >= state.prev_rsi_14 + 0.5
+                and (state.vol_sma_20 <= 0 or state.closed_volume >= state.vol_sma_20 * 1.05)
+                and (state.regime != "high_vol" or (state.closed_close > state.ema_50 and state.orderbook_imbalance >= 0.0))
             )
-            cond_ob_ok = state.orderbook_imbalance > -0.45
+            cond_ob_ok = state.orderbook_imbalance > -0.25
 
-            if cond_rsi_oversold and (cond_bb_support or state.rsi_14 < 33.5) and cond_buying_pressure and cond_ob_ok:
-                direction = "long"
-                rsi_bonus = min(0.08, max(0.0, (36.0 - state.rsi_14) * 0.008))
-                ob_bonus = min(0.06, max(0.0, state.orderbook_imbalance) * 0.12)
-                if state.closed_close > state.closed_open and (
-                    state.orderbook_imbalance >= 0.0 or state.rsi_14 < 30.0
-                ):
-                    setup_quality = 3
-                    confidence = min(0.94, 0.78 + rsi_bonus + ob_bonus)
+            if cond_rsi_oversold and cond_bb_support and cond_buying_pressure and cond_ob_ok:
+                if block_longs_below_btc and btc_below_ema200:
+                    reasons.append("Long entry blocked: BTC is below its EMA200.")
                 else:
-                    setup_quality = 2
-                    confidence = min(0.88, max(0.73, 0.73 + rsi_bonus + ob_bonus))
-                reasons.append(
-                    f"Mean Reversion Dip Long: Low({state.closed_low:.4f})~BB_Lower({state.bb_lower:.4f}), "
-                    f"RSI={state.rsi_14:.1f} (prev {state.prev_rsi_14:.1f}), "
-                    f"BuyingPressure=True, OB_Imb={state.orderbook_imbalance:+.2f}"
-                )
+                    direction = "long"
+                    strategy_id = "mean_reversion_dip"
+                    rsi_bonus = min(0.08, max(0.0, (36.0 - state.rsi_14) * 0.008))
+                    ob_bonus = min(0.06, max(0.0, state.orderbook_imbalance) * 0.12)
+                    if state.closed_close > state.closed_open and (
+                        state.orderbook_imbalance >= 0.0 or state.rsi_14 < 28.0
+                    ):
+                        setup_quality = 3
+                        confidence = min(0.94, 0.78 + rsi_bonus + ob_bonus)
+                    else:
+                        setup_quality = 2
+                        confidence = min(0.88, max(0.73, 0.73 + rsi_bonus + ob_bonus))
+                    reasons.append(
+                        f"Mean Reversion Dip Long: Low({state.closed_low:.4f})~BB_Lower({state.bb_lower:.4f}), "
+                        f"RSI={state.rsi_14:.1f} (prev {state.prev_rsi_14:.1f}), "
+                        f"BuyingPressure=True, OB_Imb={state.orderbook_imbalance:+.2f}"
+                    )
             elif cond_intraday_momentum and cond_ob_ok:
-                direction = "long"
-                ob_bonus = min(0.06, max(0.0, state.orderbook_imbalance) * 0.12)
-                if state.closed_close > state.ema_50 and state.orderbook_imbalance >= 0.05:
-                    setup_quality = 3
-                    confidence = min(0.90, 0.78 + ob_bonus)
+                if block_longs_below_btc and btc_below_ema200:
+                    reasons.append("Long entry blocked: BTC is below its EMA200.")
                 else:
-                    setup_quality = 2
-                    confidence = min(0.85, 0.73 + ob_bonus)
-                reasons.append(
-                    f"Intraday Momentum Bounce Long: Close({state.closed_close:.4f})>EMA21({state.ema_21:.4f}), "
-                    f"RSI={state.rsi_14:.1f} rising, OB_Imb={state.orderbook_imbalance:+.2f}"
-                )
-            elif (cond_bb_support or cond_rsi_oversold) and cond_ob_ok:
-                direction = "long"
-                setup_quality = 1
-                confidence = 0.60
-                reasons.append(
-                    f"Developing Mean Reversion dip (RSI={state.rsi_14:.1f}, Low={state.closed_low:.4f} vs BB_Low={state.bb_lower:.4f}); awaiting confirmation."
-                )
+                    direction = "long"
+                    strategy_id = "intraday_bounce"
+                    ob_bonus = min(0.06, max(0.0, state.orderbook_imbalance) * 0.12)
+                    if state.closed_close > state.ema_50 and state.orderbook_imbalance >= 0.05:
+                        setup_quality = 3
+                        confidence = min(0.90, 0.78 + ob_bonus)
+                    else:
+                        setup_quality = 2
+                        confidence = min(0.85, 0.73 + ob_bonus)
+                    reasons.append(
+                        f"Intraday Momentum Bounce Long: Close({state.closed_close:.4f})>EMA21({state.ema_21:.4f}), "
+                        f"RSI={state.rsi_14:.1f} rising, OB_Imb={state.orderbook_imbalance:+.2f}"
+                    )
+            elif cond_bb_support and cond_rsi_oversold and cond_ob_ok:
+                if not (block_longs_below_btc and btc_below_ema200):
+                    direction = "long"
+                    strategy_id = "mean_reversion_dip"
+                    setup_quality = 1
+                    confidence = 0.60
+                    reasons.append(
+                        f"Developing Mean Reversion dip (RSI={state.rsi_14:.1f}, Low={state.closed_low:.4f} vs BB_Low={state.bb_lower:.4f}); awaiting confirmation."
+                    )
             else:
                 reasons.append("Neutral oscillating state inside Bollinger Bands.")
 
@@ -191,6 +219,8 @@ class DecisionReflexScorer:
             take_profit_price=round(take_profit_price, 8),
             expected_reward_risk_ratio=round(expected_rr, 4),
             rationale=" | ".join(reasons),
+            strategy_id=strategy_id,
+            side=direction,
         )
 
         if self.db is not None:

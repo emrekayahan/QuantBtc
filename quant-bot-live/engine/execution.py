@@ -15,6 +15,7 @@ from engine.exchange import BinanceExchangeWrapper
 from engine.pre_trade_analyzer import PreTradeAnalyzer
 from engine.risk_engine import RiskEngine
 from engine.schemas import ReflexDecisionSchema
+from engine.task_registry import TaskRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ class ExecutionEngine:
             exchange=exchange,
             telegram=telegram,
         )
+        self.task_registry = TaskRegistry()
 
     @staticmethod
     def build_client_order_id(symbol: str, causal_timestamp_ms: int, prefix: str = "QB") -> str:
@@ -116,6 +118,10 @@ class ExecutionEngine:
         3. Pass through PreTradeAnalyzer (Orderbook Wall + Mistake Learner + 3-bullet Telegram briefing).
         4. Place idempotent entry order with QB_{SYMBOL}_{CAUSAL_TS} clientOrderId and Server-Side Stop-Loss.
         """
+        if not self.task_registry.accepting_entries:
+            logger.warning("Rejecting entry for %s: Engine shutdown in progress.", decision.symbol)
+            return {"executed": False, "reason": "SHUTDOWN_IN_PROGRESS", "decision": decision.model_dump()}
+
         await self.exchange.ensure_markets_loaded()
         min_notional = self.exchange.get_min_notional(decision.symbol, default_min_usd=10.0)
 
@@ -181,6 +187,132 @@ class ExecutionEngine:
         entry_client_id = self.build_client_order_id(
             decision.symbol, decision.causal_timestamp_ms, prefix="QB"
         )
+
+        # === T0: PAPER TRADING SIMULATION PATH ===
+        if getattr(self.cfg, "is_paper", True):
+            logger.info("Executing paper trade for %s in %s mode (leverage=%dx)", decision.symbol, trading_mode, leverage)
+            fill_price = float(entry_price_fmt)
+            filled_qty = qty
+            cost_usd = round(filled_qty * fill_price, 4)
+            margin_usd = round(cost_usd / max(leverage, 1), 4)
+            exchange_order_id = f"PAPER_ENTRY_{decision.causal_timestamp_ms}"
+            sl_client_id = self.build_client_order_id(decision.symbol, decision.causal_timestamp_ms, prefix="QBSL")
+            sl_exchange_id = f"PAPER_SL_{decision.causal_timestamp_ms}"
+            stop_price = self.exchange.price_to_precision(decision.symbol, decision.invalidation_price)
+            limit_sl_price = self.exchange.price_to_precision(decision.symbol, decision.invalidation_price * 0.997)
+
+            self.db.upsert_order(
+                {
+                    "client_order_id": entry_client_id,
+                    "exchange_order_id": exchange_order_id,
+                    "symbol": decision.symbol,
+                    "side": "buy",
+                    "order_type": "limit",
+                    "status": "closed",
+                    "price": fill_price,
+                    "stop_price": None,
+                    "amount": qty,
+                    "filled": filled_qty,
+                    "cost_usd": cost_usd,
+                    "causal_timestamp_ms": decision.causal_timestamp_ms,
+                }
+            )
+            self.db.upsert_order(
+                {
+                    "client_order_id": sl_client_id,
+                    "exchange_order_id": sl_exchange_id,
+                    "symbol": decision.symbol,
+                    "side": "sell",
+                    "order_type": "STOP_LOSS_LIMIT",
+                    "status": "open",
+                    "price": float(limit_sl_price),
+                    "stop_price": float(stop_price),
+                    "amount": filled_qty,
+                    "filled": 0.0,
+                    "cost_usd": 0.0,
+                    "causal_timestamp_ms": decision.causal_timestamp_ms,
+                }
+            )
+
+            position_id = f"POS_{decision.symbol.replace('/', '')}_{decision.causal_timestamp_ms}"
+            self.db.open_position(
+                {
+                    "position_id": position_id,
+                    "symbol": decision.symbol,
+                    "status": "OPEN",
+                    "entry_client_order_id": entry_client_id,
+                    "entry_exchange_order_id": exchange_order_id,
+                    "sl_client_order_id": sl_client_id,
+                    "sl_exchange_order_id": sl_exchange_id,
+                    "entry_price": fill_price,
+                    "current_price": fill_price,
+                    "invalidation_price": float(stop_price),
+                    "take_profit_price": decision.take_profit_price,
+                    "quantity": filled_qty,
+                    "cost_usd": cost_usd,
+                    "direction_confidence": decision.direction_confidence,
+                    "setup_quality": decision.setup_quality,
+                    "regime": decision.regime,
+                    "opened_at_ms": int(time.time() * 1000),
+                    "market_type": trading_mode.lower(),
+                    "leverage": leverage,
+                    "margin_usd": margin_usd,
+                    "notional_usd": cost_usd,
+                    "sl_slippage_pct": 0.0,
+                    "is_paper": True,
+                }
+            )
+            self.db.save_reflex_decision(decision.model_dump(), executed=True)
+
+            # Record cash deduction in paper ledger
+            if trading_mode.lower() == "futures":
+                fee_rate = getattr(self.cfg, "FUTURES_FEE_PCT", 0.05) / 100.0
+                fee_usd = cost_usd * fee_rate
+                deduction = margin_usd + fee_usd
+                self.db.record_paper_ledger(
+                    event="ENTRY_BUY_FUTURES",
+                    amount=-deduction,
+                    symbol=decision.symbol,
+                    details={"cost_usd": cost_usd, "margin_usd": margin_usd, "fee_usd": fee_usd, "leverage": leverage},
+                )
+            else:
+                fee_rate = getattr(self.cfg, "SPOT_FEE_PCT", 0.10) / 100.0
+                fee_usd = cost_usd * fee_rate
+                deduction = cost_usd + fee_usd
+                self.db.record_paper_ledger(
+                    event="ENTRY_BUY_SPOT",
+                    amount=-deduction,
+                    symbol=decision.symbol,
+                    details={"cost_usd": cost_usd, "fee_usd": fee_usd, "price": fill_price, "qty": filled_qty},
+                )
+
+            if self.telegram is not None:
+                asyncio.create_task(
+                    self.telegram.notify_entry(
+                        symbol=decision.symbol,
+                        pos_id=position_id,
+                        entry_price=fill_price,
+                        qty=filled_qty,
+                        cost_usd=cost_usd,
+                        invalidation_price=float(stop_price),
+                        take_profit_price=decision.take_profit_price,
+                        confidence=decision.direction_confidence,
+                        regime=f"{decision.regime} (PAPER {trading_mode}{f' {leverage}x' if leverage > 1 else ''})",
+                    )
+                )
+
+            return {
+                "executed": True,
+                "emergency_flattened": False,
+                "position_id": position_id,
+                "trading_mode": trading_mode,
+                "leverage": leverage,
+                "entry_order": {"id": exchange_order_id, "clientOrderId": entry_client_id, "status": "closed", "filled": filled_qty, "price": fill_price},
+                "sl_order": {"id": sl_exchange_id, "clientOrderId": sl_client_id, "status": "open", "price": float(limit_sl_price), "stopPrice": float(stop_price)},
+                "position_usd": position_usd,
+                "quantity": filled_qty,
+                "is_paper": True,
+            }
 
         # Configure Isolated Margin & Leverage if running in FUTURES mode
         use_futures_client = (
@@ -263,7 +395,7 @@ class ExecutionEngine:
                         "🔧 *Çözüm (1 Dakika):*\n"
                         "1. Binance -> **API Management** sayfasına girin.\n"
                         "2. **Edit restrictions**'a tıklayın.\n"
-                        "3. **Restrict access to trusted IPs only** seçeneğini işaretleyip sunucu IP'miz olan **`34.17.158.26`** adresini ekleyin.\n"
+                        "3. **Restrict access to trusted IPs only** seçeneğini işaretleyip sunucu IP adresinizi ekleyin.\n"
                         "4. **Enable Spot & Margin Trading** ve **Enable Futures** kutucuklarını işaretleyip **Save** yapın."
                     )
             raise
@@ -272,7 +404,127 @@ class ExecutionEngine:
             await self.telegram.send_message(pre_trade_msg)
 
         exchange_order_id = str(entry_order.get("id") or entry_order.get("exchange_order_id") or "")
-        filled_qty = float(entry_order.get("filled") or entry_order.get("amount") or qty)
+        raw_filled = entry_order.get("filled")
+        filled_qty = float(raw_filled or 0.0)
+        order_status = str(entry_order.get("status") or "closed").lower()
+
+        # === T1: ENTRY TTL & POLL LOOP ===
+        ttl_sec = float(getattr(self.cfg, "ENTRY_ORDER_TTL_SEC", 90.0))
+        poll_interval_sec = float(getattr(self.cfg, "ENTRY_ORDER_POLL_SEC", 2.0))
+
+        sl_order: Optional[Dict[str, Any]] = None
+        sl_interim_qty: float = 0.0
+
+        if is_live_ccxt and (filled_qty < qty or order_status == "open"):
+            start_poll_time = time.time()
+            while time.time() - start_poll_time < ttl_sec:
+                await asyncio.sleep(poll_interval_sec)
+                try:
+                    refreshed = (
+                        await self.exchange.fetch_futures_order(exchange_order_id, decision.symbol)
+                        if use_futures_client and hasattr(self.exchange, "fetch_futures_order")
+                        else await self.exchange.fetch_order(exchange_order_id, decision.symbol)
+                    )
+                    if refreshed:
+                        entry_order = refreshed
+                        filled_qty = float(entry_order.get("filled") or 0.0)
+                        order_status = str(entry_order.get("status") or order_status).lower()
+
+                        # Immediate SL placement for partial fills during poll loop (<=5 sec response)
+                        if filled_qty > 0.0 and sl_order is None:
+                            try:
+                                poll_stop_p = (
+                                    self.exchange.futures_price_to_precision(decision.symbol, decision.invalidation_price)
+                                    if use_futures_client
+                                    else self.exchange.price_to_precision(decision.symbol, decision.invalidation_price)
+                                )
+                                poll_limit_p = (
+                                    self.exchange.futures_price_to_precision(decision.symbol, decision.invalidation_price * 0.997)
+                                    if use_futures_client
+                                    else self.exchange.price_to_precision(decision.symbol, decision.invalidation_price * 0.997)
+                                )
+                                poll_sl_qty = (
+                                    self.exchange.futures_amount_to_precision(decision.symbol, filled_qty)
+                                    if use_futures_client
+                                    else self.exchange.amount_to_precision(decision.symbol, filled_qty * 0.999)
+                                )
+                                poll_client_id = self.build_client_order_id(decision.symbol, decision.causal_timestamp_ms, prefix="QBSL")
+                                if use_futures_client:
+                                    sl_order = await self.exchange.create_futures_order(
+                                        symbol=decision.symbol,
+                                        order_type="STOP",
+                                        side="sell",
+                                        amount=poll_sl_qty,
+                                        price=poll_limit_p,
+                                        params={"stopPrice": poll_stop_p, "reduceOnly": True, "newClientOrderId": poll_client_id},
+                                    )
+                                else:
+                                    sl_order = await self.exchange.create_order(
+                                        symbol=decision.symbol,
+                                        order_type="STOP_LOSS_LIMIT",
+                                        side="sell",
+                                        amount=poll_sl_qty,
+                                        price=poll_limit_p,
+                                        params={"stopPrice": poll_stop_p, "timeInForce": "GTC", "newClientOrderId": poll_client_id},
+                                    )
+                                sl_interim_qty = poll_sl_qty
+                                logger.info("Immediate partial-fill SL placed during poll loop for %s: qty=%.6f", decision.symbol, poll_sl_qty)
+                            except Exception as sl_poll_err:
+                                logger.warning("Immediate partial SL placement warning for %s: %s", decision.symbol, sl_poll_err)
+
+                        if order_status in ("closed", "canceled", "rejected", "expired") or filled_qty >= qty:
+                            break
+                except Exception as poll_exc:
+                    logger.debug("Transient error polling entry order %s: %s", exchange_order_id, poll_exc)
+
+            # If still open after TTL or early exit, cancel the remaining unfilled balance
+            if order_status == "open":
+                try:
+                    if use_futures_client and getattr(self.exchange, "futures_client", None) is not None:
+                        fut_sym = self.exchange.resolve_futures_symbol(decision.symbol)
+                        await self.exchange.futures_client.cancel_order(exchange_order_id, fut_sym)
+                    else:
+                        await self.exchange.cancel_order(exchange_order_id, decision.symbol)
+                    order_status = "canceled" if filled_qty <= 0.0 else "closed"
+                except Exception as cancel_exc:
+                    logger.warning("Could not cancel remaining open entry order %s: %s", exchange_order_id, cancel_exc)
+
+                # Final refresh after cancellation to get exact filled quantity
+                try:
+                    final_check = (
+                        await self.exchange.fetch_futures_order(exchange_order_id, decision.symbol)
+                        if use_futures_client and hasattr(self.exchange, "fetch_futures_order")
+                        else await self.exchange.fetch_order(exchange_order_id, decision.symbol)
+                    )
+                    if final_check:
+                        entry_order = final_check
+                        filled_qty = float(entry_order.get("filled") or filled_qty)
+                        order_status = str(entry_order.get("status") or order_status).lower()
+                except Exception as final_exc:
+                    logger.debug("Could not run final fetch for order %s: %s", exchange_order_id, final_exc)
+
+            if filled_qty <= 0.0:
+                self.db.upsert_order(
+                    {
+                        "client_order_id": entry_client_id,
+                        "exchange_order_id": exchange_order_id,
+                        "symbol": decision.symbol,
+                        "side": "buy",
+                        "order_type": "limit",
+                        "status": "canceled",
+                        "price": float(entry_order.get("price") or entry_price_fmt),
+                        "stop_price": None,
+                        "amount": qty,
+                        "filled": 0.0,
+                        "cost_usd": 0.0,
+                        "causal_timestamp_ms": decision.causal_timestamp_ms,
+                    }
+                )
+                return {
+                    "executed": False,
+                    "reason": f"Limit buy order {exchange_order_id} expired after TTL ({ttl_sec}s) with 0 fill and was canceled.",
+                }
+
         fill_price = float(
             entry_order.get("average") or entry_order.get("price") or entry_price_fmt
         )
@@ -285,7 +537,7 @@ class ExecutionEngine:
                 "symbol": decision.symbol,
                 "side": "buy",
                 "order_type": "limit",
-                "status": str(entry_order.get("status") or "closed"),
+                "status": "closed" if filled_qty > 0.0 else order_status,
                 "price": fill_price,
                 "stop_price": None,
                 "amount": qty,
@@ -332,74 +584,133 @@ class ExecutionEngine:
         )
 
         # Place mandatory Server-Side STOP_LOSS_LIMIT within 500ms (up to 3 attempts)
-        sl_order: Optional[Dict[str, Any]] = None
         sl_error: Optional[Exception] = None
-        for sl_attempt in range(1, 4):
-            try:
-                if use_futures_client:
-                    sl_order = await self.exchange.create_futures_order(
-                        symbol=decision.symbol,
-                        order_type="STOP",
-                        side="sell",
-                        amount=sl_qty,
-                        price=limit_sl_price,
-                        params={
-                            "stopPrice": stop_price,
-                            "reduceOnly": True,
-                            "newClientOrderId": sl_client_id,
-                        },
-                    )
-                else:
-                    sl_order = await self.exchange.create_order(
-                        symbol=decision.symbol,
-                        order_type="STOP_LOSS_LIMIT",
-                        side="sell",
-                        amount=sl_qty,
-                        price=limit_sl_price,
-                        params={
-                            "stopPrice": stop_price,
-                            "timeInForce": "GTC",
-                            "newClientOrderId": sl_client_id,
-                        },
-                    )
-                break
-            except Exception as exc:
-                sl_error = exc
-                logger.error(
-                    "Server-Side Stop-Loss attempt %d/3 failed for %s: %s",
-                    sl_attempt,
-                    decision.symbol,
-                    exc,
-                )
-                if sl_attempt < 3:
-                    await asyncio.sleep(0.1)
+        if sl_order is not None:
+            if abs(sl_interim_qty - sl_qty) < 1e-8:
+                # Interim SL placed during poll already covers exact final filled quantity
+                logger.debug("Reusing immediate poll SL %s for %s", sl_order.get("id"), decision.symbol)
+            else:
+                # Cancel smaller interim SL to re-arm with complete final filled amount
+                try:
+                    interim_id = str(sl_order.get("id") or "")
+                    if use_futures_client and getattr(self.exchange, "futures_client", None) is not None:
+                        fut_sym = self.exchange.resolve_futures_symbol(decision.symbol)
+                        await self.exchange.futures_client.cancel_order(interim_id, fut_sym, params={"stop": True})
+                    else:
+                        await self.exchange.cancel_order(interim_id, decision.symbol)
+                except Exception:
+                    pass
+                sl_order = None
 
         if sl_order is None:
-            # EMERGENCY FLATTEN RULE: Immediately market-sell unprotected position and pause symbol for 4h
+            for sl_attempt in range(1, 4):
+                try:
+                    if use_futures_client:
+                        sl_order = await self.exchange.create_futures_order(
+                            symbol=decision.symbol,
+                            order_type="STOP",
+                            side="sell",
+                            amount=sl_qty,
+                            price=limit_sl_price,
+                            params={
+                                "stopPrice": stop_price,
+                                "reduceOnly": True,
+                                "newClientOrderId": sl_client_id,
+                            },
+                        )
+                    else:
+                        sl_order = await self.exchange.create_order(
+                            symbol=decision.symbol,
+                            order_type="STOP_LOSS_LIMIT",
+                            side="sell",
+                            amount=sl_qty,
+                            price=limit_sl_price,
+                            params={
+                                "stopPrice": stop_price,
+                                "timeInForce": "GTC",
+                                "newClientOrderId": sl_client_id,
+                            },
+                        )
+                    break
+                except Exception as exc:
+                    sl_error = exc
+                    logger.error(
+                        "Server-Side Stop-Loss attempt %d/3 failed for %s: %s",
+                        sl_attempt,
+                        decision.symbol,
+                        exc,
+                    )
+                    if sl_attempt < 3:
+                        await asyncio.sleep(0.1)
+
+        if sl_order is None:
+            # EMERGENCY FLATTEN RULE: Mark position as OPEN_UNPROTECTED first so state reconciler knows it's exposed
+            unprot_pos_id = f"POS_{decision.symbol.replace('/', '')}_{decision.causal_timestamp_ms}"
+            self.db.open_position(
+                {
+                    "position_id": unprot_pos_id,
+                    "symbol": decision.symbol,
+                    "status": "OPEN_UNPROTECTED",
+                    "entry_client_order_id": entry_client_id,
+                    "entry_exchange_order_id": exchange_order_id,
+                    "sl_client_order_id": None,
+                    "sl_exchange_order_id": None,
+                    "entry_price": fill_price,
+                    "current_price": fill_price,
+                    "invalidation_price": stop_price,
+                    "take_profit_price": decision.take_profit_price,
+                    "quantity": sl_qty,
+                    "cost_usd": cost_usd,
+                    "direction_confidence": decision.direction_confidence,
+                    "setup_quality": decision.setup_quality,
+                    "regime": decision.regime,
+                    "opened_at_ms": int(time.time() * 1000),
+                    "market_type": trading_mode.lower(),
+                    "leverage": leverage,
+                    "margin_usd": round(cost_usd / max(leverage, 1), 4) if use_futures_client else cost_usd,
+                    "notional_usd": cost_usd,
+                    "sl_slippage_pct": 0.0,
+                    "is_paper": False,
+                }
+            )
+
             logger.critical(
                 "CRITICAL: Server-Side Stop-Loss failed after 3 attempts on %s (%s). "
                 "Executing immediate market sell to eliminate unprotected exposure!",
                 decision.symbol,
                 sl_error,
             )
-            if use_futures_client:
-                emergency_sell = await self.exchange.create_futures_order(
-                    symbol=decision.symbol,
-                    order_type="market",
-                    side="sell",
-                    amount=sl_qty,
-                    price=None,
-                    params={"reduceOnly": True},
+            emergency_sell = None
+            try:
+                if use_futures_client:
+                    emergency_sell = await self.exchange.create_futures_order(
+                        symbol=decision.symbol,
+                        order_type="market",
+                        side="sell",
+                        amount=sl_qty,
+                        price=None,
+                        params={"reduceOnly": True},
+                    )
+                else:
+                    emergency_sell = await self.exchange.create_market_sell_order(decision.symbol, sl_qty)
+                
+                # If market sell succeeded, close the position cleanly
+                exit_price = float((emergency_sell or {}).get("average") or (emergency_sell or {}).get("price") or fill_price)
+                self.db.close_position(
+                    position_id=unprot_pos_id,
+                    exit_price=exit_price,
+                    close_reason="EMERGENCY_FLATTEN_SL_PLACEMENT_FAILED",
                 )
-            else:
-                emergency_sell = await self.exchange.create_market_sell_order(decision.symbol, sl_qty)
+            except Exception as em_exc:
+                logger.critical("EMERGENCY FLATTEN SELL FAILED on %s: %s! Position remains in OPEN_UNPROTECTED status!", decision.symbol, em_exc)
+
             self.db.pause_symbol(decision.symbol, duration_seconds=4 * 3600)
             self.db.save_reflex_decision(decision.model_dump(), executed=False)
             return {
                 "executed": False,
                 "emergency_flattened": True,
                 "symbol": decision.symbol,
-                "reason": f"SL placement failed after 3 retries ({sl_error}); position immediately market-sold.",
+                "reason": f"SL placement failed after 3 retries ({sl_error}); position market-sold.",
                 "emergency_sell_order": emergency_sell,
             }
 
@@ -422,10 +733,12 @@ class ExecutionEngine:
         )
 
         position_id = f"POS_{decision.symbol.replace('/', '')}_{decision.causal_timestamp_ms}"
+        margin_usd = round(cost_usd / max(leverage, 1), 4) if use_futures_client else cost_usd
         self.db.open_position(
             {
                 "position_id": position_id,
                 "symbol": decision.symbol,
+                "status": "OPEN",
                 "entry_client_order_id": entry_client_id,
                 "entry_exchange_order_id": exchange_order_id,
                 "sl_client_order_id": sl_client_id,
@@ -440,9 +753,41 @@ class ExecutionEngine:
                 "setup_quality": decision.setup_quality,
                 "regime": decision.regime,
                 "opened_at_ms": int(time.time() * 1000),
+                "market_type": trading_mode.lower(),
+                "leverage": leverage,
+                "margin_usd": margin_usd,
+                "notional_usd": cost_usd,
+                "sl_slippage_pct": 0.0,
+                "is_paper": False,
             }
         )
         self.db.save_reflex_decision(decision.model_dump(), executed=True)
+
+        # R12: Record entry-time features for pristine mistake learning
+        try:
+            snap = self.db.get_latest_state_snapshot(decision.symbol) or {}
+            self.db.save_trade_features(
+                {
+                    "position_id": position_id,
+                    "strategy_id": str(getattr(decision, "strategy_id", None) or decision.regime),
+                    "regime": decision.regime,
+                    "rsi": float(snap.get("rsi_14", 50.0)),
+                    "prev_rsi": float(snap.get("prev_rsi_14", 50.0)),
+                    "adx": float(snap.get("adx_14", 20.0)),
+                    "atr_pct": float(snap.get("atr_14", 1.0)) / max(fill_price, 1e-9) * 100.0,
+                    "bb_dist_pct": (fill_price - float(snap.get("bb_lower", fill_price))) / max(fill_price, 1e-9) * 100.0,
+                    "ema_dist_pct": (fill_price - float(snap.get("ema_21", fill_price))) / max(fill_price, 1e-9) * 100.0,
+                    "vol_ratio": float(snap.get("closed_volume", 1.0)) / max(float(snap.get("vol_sma_20", 1.0)), 1e-9),
+                    "ob_imbalance": float(snap.get("orderbook_imbalance", 0.0)),
+                    "spread_bps": float(snap.get("spread_bps", 0.0)),
+                    "btc_trend_state": str(self.db.get_state("macro_regime", "neutral")),
+                    "hour_utc": int(time.gmtime().tm_hour),
+                    "side": str(decision.direction),
+                    "leverage": leverage,
+                }
+            )
+        except Exception as tf_exc:
+            logger.debug("Could not record trade features for %s: %s", position_id, tf_exc)
 
         if self.telegram is not None:
             asyncio.create_task(
@@ -475,7 +820,7 @@ class ExecutionEngine:
         self, position_id: str, reason: str = "MANUAL_MARKET_CLOSE"
     ) -> Dict[str, Any]:
         """Cancel open Server-Side SL order for a specific position and market-sell its tokens/contracts."""
-        open_positions = self.db.get_open_positions()
+        open_positions = self.db.get_open_positions(include_unprotected=True)
         target = next((p for p in open_positions if p["position_id"] == position_id), None)
         if target is None:
             return {"closed": False, "reason": f"Open position {position_id} not found."}
@@ -483,6 +828,28 @@ class ExecutionEngine:
         symbol = target["symbol"]
         qty = float(target["quantity"])
         sl_order_id = target.get("sl_exchange_order_id")
+
+        # In paper mode, do not send any close orders to Binance
+        if target.get("is_paper") or getattr(self.cfg, "is_paper", True):
+            exit_price = float(target.get("current_price") or target["entry_price"])
+            closed_pos = self.db.close_position(
+                position_id=position_id,
+                exit_price=exit_price,
+                close_reason=reason,
+            )
+            if self.telegram is not None and closed_pos:
+                asyncio.create_task(
+                    self.telegram.notify_exit(
+                        symbol=symbol,
+                        pos_id=position_id,
+                        entry_price=float(closed_pos.get("entry_price", target.get("entry_price", 0))),
+                        exit_price=exit_price,
+                        qty=qty,
+                        realized_pnl=float(closed_pos.get("realized_pnl_usd", 0.0)),
+                        reason=f"PAPER_{reason}",
+                    )
+                )
+            return {"closed": True, "position_id": position_id, "exit_price": exit_price, "is_paper": True}
 
         fut_positions = {}
         if hasattr(self.exchange, "fetch_active_futures_positions"):
@@ -492,18 +859,9 @@ class ExecutionEngine:
         sell_order: Dict[str, Any] = {}
         if fut_pos is not None and getattr(self.exchange, "futures_client", None) is not None:
             fut_sym = self.exchange.resolve_futures_symbol(symbol)
-            if sl_order_id:
-                try:
-                    await self.exchange.futures_client.cancel_order(
-                        str(sl_order_id), fut_sym, params={"stop": True}
-                    )
-                except Exception:
-                    try:
-                        await self.exchange.futures_client.cancel_order(str(sl_order_id), fut_sym)
-                    except Exception:
-                        pass
             contracts = abs(float(fut_pos.get("contracts") or qty))
             if contracts > 0:
+                # 1. Futures: ReduceOnly market sell FIRST to lock in exit
                 sell_order = await self.exchange.create_futures_order(
                     symbol=symbol,
                     order_type="market",
@@ -512,7 +870,19 @@ class ExecutionEngine:
                     price=None,
                     params={"reduceOnly": True},
                 )
+                # 2. Cancel SL only after market sell order is submitted
+                if sl_order_id:
+                    try:
+                        await self.exchange.futures_client.cancel_order(
+                            str(sl_order_id), fut_sym, params={"stop": True}
+                        )
+                    except Exception:
+                        try:
+                            await self.exchange.futures_client.cancel_order(str(sl_order_id), fut_sym)
+                        except Exception:
+                            pass
         else:
+            # Spot: Must cancel SL first to release locked balance
             if sl_order_id:
                 try:
                     await self.exchange.cancel_order(str(sl_order_id), symbol)
@@ -521,7 +891,37 @@ class ExecutionEngine:
             try:
                 sell_order = await self.exchange.create_market_sell_order(symbol, qty)
             except Exception as exc:
-                logger.warning("Market sell warning on %s: %s", symbol, exc)
+                logger.critical("Market sell FAILED on %s: %s! RE-ARMING Stop-Loss immediately!", symbol, exc)
+                # MUST RE-ARM SL so position is not left unprotected
+                rearm_sl = None
+                try:
+                    inval_p = float(target["invalidation_price"])
+                    limit_p = self.exchange.price_to_precision(symbol, inval_p * 0.997)
+                    stop_p = self.exchange.price_to_precision(symbol, inval_p)
+                    rearm_id = f"QBSL_REARM_{int(time.time() * 1000)}"
+                    rearm_sl = await self.exchange.create_order(
+                        symbol=symbol,
+                        order_type="STOP_LOSS_LIMIT",
+                        side="sell",
+                        amount=qty,
+                        price=limit_p,
+                        params={"stopPrice": stop_p, "timeInForce": "GTC", "newClientOrderId": rearm_id},
+                    )
+                    if rearm_sl and rearm_sl.get("id"):
+                        self.db.open_position({
+                            **target,
+                            "sl_exchange_order_id": str(rearm_sl["id"]),
+                            "sl_client_order_id": rearm_id,
+                        })
+                except Exception as rearm_exc:
+                    logger.critical("FATAL: Failed to rearm SL on %s: %s!", symbol, rearm_exc)
+
+                # DO NOT mark closed in DB!
+                return {
+                    "closed": False,
+                    "position_id": position_id,
+                    "reason": f"Market sell failed ({exc}); SL rearmed: {rearm_sl is not None}",
+                }
 
         exit_price = float(
             sell_order.get("average") or sell_order.get("price") or target["current_price"]

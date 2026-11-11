@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 
-from config.settings import get_settings, settings
+from config.settings import Settings, get_settings, settings
 from database.db_manager import DatabaseManager
 from engine.exchange import BinanceExchangeWrapper
 from engine.execution import ExecutionEngine
@@ -26,11 +29,37 @@ logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 security = HTTPBasic(auto_error=False)
 
+_failed_attempts: Dict[str, List[float]] = {}
+_attempts_lock = threading.Lock()
 
-def verify_dashboard_auth(
+
+def validate_dashboard_security_or_raise(cfg: Settings) -> None:
+    """Strictly reject weak or default dashboard credentials upon startup."""
+    user = (cfg.DASHBOARD_USERNAME or "").strip()
+    pwd = (cfg.DASHBOARD_PASSWORD or "").strip()
+
+    if cfg.DASHBOARD_HOST not in ("127.0.0.1", "localhost"):
+        logger.warning(
+            "SECURITY WARNING: Dashboard host is '%s' (external). "
+            "HTTPS reverse proxy (e.g. Caddy/Nginx) is strongly required!",
+            cfg.DASHBOARD_HOST,
+        )
+
+    if not pwd:
+        raise ValueError("DASHBOARD_PASSWORD cannot be empty. Must be at least 16 characters.")
+    if pwd.startswith("change_me"):
+        raise ValueError("DASHBOARD_PASSWORD cannot use default 'change_me_*' placeholder.")
+    if len(pwd) < 16:
+        raise ValueError(f"DASHBOARD_PASSWORD is too short ({len(pwd)} chars). Minimum 16 characters required.")
+    if user.lower() == "admin":
+        raise ValueError("DASHBOARD_USERNAME cannot be 'admin'. Choose a dedicated non-default username.")
+
+
+async def verify_dashboard_auth(
+    request: Request,
     credentials: Optional[HTTPBasicCredentials] = Depends(security),
 ) -> str:
-    """Enforce constant-time HTTP Basic Authentication when DASHBOARD_PASSWORD is set."""
+    """Enforce constant-time HTTP Basic Authentication with rate limiting & anti-bruteforce delay."""
     cfg = get_settings()
     expected_user = (cfg.DASHBOARD_USERNAME or "").strip()
     expected_pass = (cfg.DASHBOARD_PASSWORD or "").strip()
@@ -38,6 +67,18 @@ def verify_dashboard_auth(
     # If operator explicitly disables password by setting empty string, allow access
     if not expected_pass:
         return "anonymous"
+
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    now = time.time()
+    with _attempts_lock:
+        timestamps = [t for t in _failed_attempts.get(client_ip, []) if now - t < 60.0]
+        _failed_attempts[client_ip] = timestamps
+        if len(timestamps) >= 5:
+            logger.warning("Rate limit exceeded for dashboard auth from IP %s", client_ip)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many failed authentication attempts. Please try again in 60 seconds.",
+            )
 
     if credentials is None:
         raise HTTPException(
@@ -50,6 +91,14 @@ def verify_dashboard_auth(
     is_pass_ok = secrets.compare_digest(credentials.password.encode("utf-8"), expected_pass.encode("utf-8"))
 
     if not (is_user_ok and is_pass_ok):
+        with _attempts_lock:
+            _failed_attempts.setdefault(client_ip, []).append(now)
+        logger.warning(
+            "Failed dashboard login attempt from IP %s for username '%s'",
+            client_ip,
+            credentials.username,
+        )
+        await asyncio.sleep(0.5)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid dashboard credentials",
@@ -100,6 +149,9 @@ def create_dashboard_app(
         daily_pnl_pct = (daily_pnl_usd / total_equity * 100.0) if total_equity > 0.0 else 0.0
         drawdown_pct = float(sys_state.get("current_drawdown_pct", "0.0") or 0.0)
         halted = sys_state.get("system_halted", "false").lower() in ("true", "1", "yes")
+        entries_blocked = sys_state.get("entries_blocked", "false").lower() in ("true", "1", "yes")
+        reconcile_ok = sys_state.get("reconcile_ok", "true").lower() in ("true", "1", "yes")
+        last_reconcile_ts = int(sys_state.get("last_reconcile_ts", "0") or 0)
 
         return JSONResponse(
             {
@@ -113,6 +165,9 @@ def create_dashboard_app(
                     "macro_commentary": sys_state.get("macro_commentary", ""),
                     "system_status": "HALTED" if halted else "ACTIVE",
                     "halt_reason": sys_state.get("halt_reason", ""),
+                    "entries_blocked": entries_blocked,
+                    "reconcile_ok": reconcile_ok,
+                    "last_reconcile_ts": last_reconcile_ts,
                     "auth_error_banner": sys_state.get("auth_error_banner", ""),
                     "clock_drift_ms": int(sys_state.get("clock_drift_ms", "0") or 0),
                     "min_confidence_threshold": float(
@@ -123,6 +178,8 @@ def create_dashboard_app(
                     "max_position_usd": float(
                         sys_state.get("max_position_usd", str(settings.MAX_POSITION_USD))
                     ),
+                    "trading_mode": str(settings.TRADING_MODE).lower(),
+                    "is_paper": settings.is_paper,
                 },
                 "open_positions": open_positions,
                 "watchlist": watchlist,
@@ -182,7 +239,15 @@ def create_dashboard_app(
         )
 
     @app.post("/api/kill-switch")
-    async def trigger_kill_switch(_user: str = Depends(verify_dashboard_auth)) -> JSONResponse:
+    async def trigger_kill_switch(
+        x_confirm: Optional[str] = Header(None, alias="X-Confirm"),
+        _user: str = Depends(verify_dashboard_auth),
+    ) -> JSONResponse:
+        if not x_confirm or x_confirm.strip().lower() != "true":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing or invalid confirmation header 'X-Confirm: true'",
+            )
         if risk_engine is None:
             db.set_system_halted(True, reason="Kill-Switch triggered via Dashboard")
             return JSONResponse(
@@ -200,14 +265,29 @@ def create_dashboard_app(
         return JSONResponse(res)
 
     @app.post("/api/resume")
-    async def resume_system(_user: str = Depends(verify_dashboard_auth)) -> JSONResponse:
+    async def resume_system(
+        x_confirm: Optional[str] = Header(None, alias="X-Confirm"),
+        _user: str = Depends(verify_dashboard_auth),
+    ) -> JSONResponse:
+        if not x_confirm or x_confirm.strip().lower() != "true":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing or invalid confirmation header 'X-Confirm: true'",
+            )
         db.set_system_halted(False, reason="Operator resumed system from Dashboard")
         return JSONResponse({"system_halted": False, "status": "ACTIVE"})
 
     @app.post("/api/positions/{position_id}/close")
     async def close_position_endpoint(
-        position_id: str, _user: str = Depends(verify_dashboard_auth)
+        position_id: str,
+        x_confirm: Optional[str] = Header(None, alias="X-Confirm"),
+        _user: str = Depends(verify_dashboard_auth),
     ) -> JSONResponse:
+        if not x_confirm or x_confirm.strip().lower() != "true":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing or invalid confirmation header 'X-Confirm: true'",
+            )
         if execution_engine is None:
             closed = db.close_position(
                 position_id=position_id,

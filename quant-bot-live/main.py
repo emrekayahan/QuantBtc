@@ -14,6 +14,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from config.log_filter import SensitiveDataFilter
 from config.settings import settings
 from dashboard.server import create_dashboard_app
 from database.db_manager import DatabaseManager
@@ -29,18 +30,32 @@ from engine.risk_engine import RiskEngine
 from engine.scanner import AutonomousMarketScanner
 from engine.state_engine import DeterministicStateEngine
 from review.overnight_review import OvernightBrierReviewer
+from review.executive_digest import ExecutiveDigest
+from engine.outcome_resolver import OutcomeResolver
 
 
 def configure_logging() -> None:
     log_dir = Path(settings.LOG_DIR)
     log_dir.mkdir(parents=True, exist_ok=True)
+    sensitive_keys = {
+        settings.BINANCE_API_KEY,
+        settings.BINANCE_API_SECRET,
+        settings.TELEGRAM_BOT_TOKEN,
+        settings.DASHBOARD_PASSWORD,
+    }
+    for k in settings.openrouter_keys:
+        sensitive_keys.add(k)
+
+    filt = SensitiveDataFilter(sensitive_keys)
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.addFilter(filt)
+    file_handler = logging.FileHandler(log_dir / "quant_bot.log", encoding="utf-8")
+    file_handler.addFilter(filt)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_dir / "quant_bot.log", encoding="utf-8"),
-        ],
+        handlers=[stdout_handler, file_handler],
     )
 
 
@@ -96,6 +111,13 @@ class AutonomousQuantEngineOrchestrator:
             db=self.db,
             openrouter_pool=self.openrouter_pool,
         )
+        self.outcome_resolver = OutcomeResolver(
+            db=self.db,
+            exchange=self.exchange,
+        )
+        self.executive_digest = ExecutiveDigest(
+            db=self.db,
+        )
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         self._last_evaluated_candle_ts: Dict[str, int] = {}
         self._stop_event = asyncio.Event()
@@ -110,6 +132,7 @@ class AutonomousQuantEngineOrchestrator:
 
         if self.cfg_has_keys():
             try:
+                await self.reconciler.run_startup_recovery()
                 await self.reconciler.reconcile_cycle()
             except Exception as exc:
                 logger.warning("Initial balance/position reconciliation warning: %s", exc)
@@ -208,6 +231,14 @@ class AutonomousQuantEngineOrchestrator:
         except Exception as exc:
             logger.warning("15m Clock drift check warning: %s", exc)
 
+    async def safe_outcome_resolver_job(self) -> None:
+        try:
+            resolved = await self.outcome_resolver.resolve_pending_signals()
+            if resolved > 0:
+                logger.info("OutcomeResolver resolved %d pending signal outcomes.", resolved)
+        except Exception as exc:
+            logger.warning("OutcomeResolver job warning: %s", exc)
+
     async def safe_overnight_brier_job(self) -> None:
         try:
             res = await self.overnight_reviewer.run_overnight_review()
@@ -258,7 +289,15 @@ class AutonomousQuantEngineOrchestrator:
             replace_existing=True,
             max_instances=1,
         )
-        # 5. 00:05 UTC Overnight Brier Score Calibration
+        # 5. 5-minute Outcome Resolver loop
+        self.scheduler.add_job(
+            self.safe_outcome_resolver_job,
+            trigger=IntervalTrigger(minutes=5),
+            id="outcome_resolver_5m",
+            replace_existing=True,
+            max_instances=1,
+        )
+        # 6. 00:05 UTC Overnight Brier Score Calibration
         self.scheduler.add_job(
             self.safe_overnight_brier_job,
             trigger=CronTrigger(hour=0, minute=5, timezone="UTC"),
@@ -266,6 +305,21 @@ class AutonomousQuantEngineOrchestrator:
             replace_existing=True,
             max_instances=1,
         )
+        # 7. 21:00 UTC Daily Executive Broker Digest
+        self.scheduler.add_job(
+            self.safe_daily_digest_job,
+            trigger=CronTrigger(hour=21, minute=0, timezone="UTC"),
+            id="daily_digest_2100",
+            replace_existing=True,
+            max_instances=1,
+        )
+
+    async def safe_daily_digest_job(self) -> None:
+        try:
+            msg = self.executive_digest.generate_digest_markdown()
+            await self.telegram.send_message(msg)
+        except Exception as exc:
+            logger.error("Daily Executive Digest job error: %s", exc)
 
     async def run(self) -> None:
         await self.initial_bootstrap()
@@ -315,12 +369,25 @@ class AutonomousQuantEngineOrchestrator:
         try:
             await server.serve()
         finally:
-            logger.info("Shutting down scheduler, CCXT exchange session, and DuckDB...")
+            logger.info("Graceful shutdown: Waiting for in-flight tasks (grace period %ss)...", getattr(settings, "SHUTDOWN_GRACE_SEC", 45.0))
             await self.telegram.stop()
             if self.scheduler.running:
                 self.scheduler.shutdown(wait=False)
+            try:
+                # Wait for in-flight tasks in task_registry up to SHUTDOWN_GRACE_SEC
+                grace = float(getattr(settings, "SHUTDOWN_GRACE_SEC", 45.0))
+                if hasattr(self, "execution_engine") and hasattr(self.execution_engine, "task_registry"):
+                    completed = await self.execution_engine.task_registry.wait_for_completion(timeout_sec=grace)
+                    if not completed:
+                        logger.warning("Shutdown grace period elapsed before all tasks finished.")
+                else:
+                    await asyncio.sleep(min(1.0, grace))
+            except Exception as task_wait_err:
+                logger.warning("Error waiting for in-flight tasks during shutdown: %s", task_wait_err)
+            logger.info("Closing CCXT exchange sessions and flushing DuckDB...")
             await self.exchange.close()
             self.db.close()
+            logger.info("Engine successfully shut down with clean state.")
 
     def _handle_shutdown_signal(self, server: uvicorn.Server) -> None:
         logger.info("Received termination signal. Initiating graceful shutdown...")
