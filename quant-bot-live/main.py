@@ -128,6 +128,12 @@ class AutonomousQuantEngineOrchestrator:
         from scripts.migrate_legacy_db import check_startup_safety
         check_startup_safety(settings)
 
+        # Enforce AUTONOMY_START_LEVEL on startup if configured
+        start_level = int(getattr(settings, "AUTONOMY_START_LEVEL", 1))
+        current_level = int(self.db.get_state("autonomy_level", "0") or 0)
+        if current_level < start_level:
+            self.db.set_autonomy_level(start_level, f"Enforced AUTONOMY_START_LEVEL={start_level} from settings on startup")
+
         db_file = Path(settings.effective_db_path).name
         open_pos_count = len(self.db.get_open_positions())
         blocked = self.db.get_state("entries_blocked", "false") == "true"
