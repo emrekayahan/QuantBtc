@@ -122,6 +122,7 @@ class OvernightBrierReviewer:
                 "max_position_usd": current_max_pos,
                 "notes": notes,
                 "audit_file": str(audit_file),
+                "autonomy_promoted": False,
             }
 
         # Calculate Brier score and reliability table
@@ -212,6 +213,41 @@ class OvernightBrierReviewer:
         audit_file = log_dir / f"overnight_audit_{today_str}.md"
         audit_file.write_text(notes, encoding="utf-8")
 
+        # S8: Autonomy Level Auto-Promotion check
+        # Only promote from Level 1 to Level 2 if signal_outcomes has n >= 100 and lower-bound 95% CI of net R >= 0
+        autonomy_promoted = False
+        current_level = self.db.get_autonomy_level()
+        if current_level == 1:
+            all_outcomes = self.db.get_signal_outcomes(limit=1000)
+            if len(all_outcomes) >= 100:
+                r_nets = [float(o.get("r_net", 0.0)) for o in all_outcomes if o.get("r_net") is not None]
+                if len(r_nets) >= 100:
+                    n_r = len(r_nets)
+                    mean_r = sum(r_nets) / n_r
+                    variance_r = sum((x - mean_r) ** 2 for x in r_nets) / max(n_r - 1, 1)
+                    std_err = (variance_r / n_r) ** 0.5
+                    lower_bound_ci = mean_r - (1.96 * std_err)
+                    if lower_bound_ci >= 0.0:
+                        self.db.set_autonomy_level(
+                            2,
+                            f"Auto-promoted from L1 to L2: n={n_r}, mean_R={mean_r:.3f}, 95% CI lower-bound={lower_bound_ci:.3f} >= 0",
+                        )
+                        autonomy_promoted = True
+                        logger.info(
+                            "Autonomy promoted to Level 2! (n=%d, mean_R=%.3f, CI_lower=%.3f)",
+                            n_r, mean_r, lower_bound_ci
+                        )
+                    else:
+                        logger.info(
+                            "Autonomy Level 1 maintained: lower-bound 95% CI (%.3f) < 0 (n=%d, mean_R=%.3f)",
+                            lower_bound_ci, n_r, mean_r
+                        )
+            else:
+                logger.info(
+                    "Autonomy Level 1 maintained: signal outcomes sample count (%d) < 100",
+                    len(all_outcomes),
+                )
+
         return {
             "status": "CALIBRATED",
             "review_date": today_str,
@@ -221,4 +257,5 @@ class OvernightBrierReviewer:
             "max_position_usd": new_max_pos,
             "notes": notes,
             "audit_file": str(audit_file),
+            "autonomy_promoted": autonomy_promoted,
         }

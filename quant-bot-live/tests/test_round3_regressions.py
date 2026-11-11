@@ -1061,5 +1061,154 @@ async def test_market_router_is_called_from_execution(tmp_path) -> None:
         db.close()
 
 
+@pytest.mark.asyncio
+async def test_autonomy_auto_promotion_requires_100_samples_and_positive_ci(tmp_path) -> None:
+    """S8: Autonomy auto-promotion from L1 to L2 is locked unless signal_outcomes has n>=100 and lower-bound 95% CI >= 0."""
+    from review.overnight_review import OvernightBrierReviewer
+
+    cfg = Settings(TRADING_MODE="live", DB_PATH=str(tmp_path / "autonomy.db"), MIN_BRIER_SAMPLES=10, LOG_DIR=str(tmp_path / "logs"))
+    db = DatabaseManager(db_path=cfg.DB_PATH)
+    db.set_autonomy_level(1, "Initial test level")
+    reviewer = OvernightBrierReviewer(db=db, custom_settings=cfg)
+
+    try:
+        now_ms = int(time.time() * 1000)
+        # 1. With only 50 positive outcomes (n < 100), promotion MUST NOT happen
+        for i in range(50):
+            ts = now_ms - (i * 60000)
+            dec_id = f"BTC/USDT_{ts}"
+            db.save_reflex_decision({
+                "symbol": "BTC/USDT",
+                "causal_timestamp_ms": ts,
+                "regime": "mean_reverting",
+                "direction": "long",
+                "toxic_flow": "none",
+                "setup_quality": 3,
+                "direction_confidence": 0.80,
+                "risk_state": "safe",
+                "entry_price": 50000.0,
+                "invalidation_price": 49000.0,
+                "take_profit_price": 52000.0,
+                "expected_reward_risk_ratio": 2.0,
+                "rationale": "Test proposal",
+            })
+            db.save_signal_outcome({
+                "decision_id": dec_id,
+                "symbol": "BTC/USDT",
+                "strategy_id": "test",
+                "side": "long",
+                "entry": 50000.0,
+                "sl": 49000.0,
+                "tp": 52000.0,
+                "horizon_bars": 32,
+                "result": "TP",
+                "r_gross": 2.0,
+                "r_net": 1.9,
+                "bars_to_exit": 10,
+                "mae_r": 0.1,
+                "mfe_r": 2.0,
+                "regime": "mean_reverting",
+                "features_json": "{}",
+                "resolved_at_ms": now_ms - (i * 60000),
+            })
+
+        res1 = await reviewer.run_overnight_review()
+        assert db.get_autonomy_level() == 1, "Promoted prematurely when n < 100!"
+        assert res1.get("autonomy_promoted") is False
+
+        # 2. Add 55 more outcomes with negative net R so n=105 but net R CI lower-bound is negative
+        for i in range(50, 105):
+            ts = now_ms - (i * 60000)
+            dec_id = f"BTC/USDT_{ts}"
+            db.save_reflex_decision({
+                "symbol": "BTC/USDT",
+                "causal_timestamp_ms": ts,
+                "regime": "mean_reverting",
+                "direction": "long",
+                "toxic_flow": "none",
+                "setup_quality": 3,
+                "direction_confidence": 0.80,
+                "risk_state": "safe",
+                "entry_price": 50000.0,
+                "invalidation_price": 49000.0,
+                "take_profit_price": 52000.0,
+                "expected_reward_risk_ratio": 2.0,
+                "rationale": "Test proposal",
+            })
+            db.save_signal_outcome({
+                "decision_id": dec_id,
+                "symbol": "BTC/USDT",
+                "strategy_id": "test",
+                "side": "long",
+                "entry": 50000.0,
+                "sl": 49000.0,
+                "tp": 52000.0,
+                "horizon_bars": 32,
+                "result": "SL",
+                "r_gross": -1.0,
+                "r_net": -1.5,
+                "bars_to_exit": 10,
+                "mae_r": 1.0,
+                "mfe_r": 0.2,
+                "regime": "mean_reverting",
+                "features_json": "{}",
+                "resolved_at_ms": now_ms - (i * 60000),
+            })
+
+        res2 = await reviewer.run_overnight_review()
+        assert db.get_autonomy_level() == 1, "Promoted when CI lower-bound < 0!"
+        assert res2.get("autonomy_promoted") is False
+
+        # 3. Now add 100 strong positive outcomes so mean R is high and lower bound 95% CI >= 0
+        for i in range(105, 210):
+            ts = now_ms - (i * 60000)
+            dec_id = f"BTC/USDT_{ts}"
+            db.save_reflex_decision({
+                "symbol": "BTC/USDT",
+                "causal_timestamp_ms": ts,
+                "regime": "mean_reverting",
+                "direction": "long",
+                "toxic_flow": "none",
+                "setup_quality": 3,
+                "direction_confidence": 0.80,
+                "risk_state": "safe",
+                "entry_price": 50000.0,
+                "invalidation_price": 49000.0,
+                "take_profit_price": 52000.0,
+                "expected_reward_risk_ratio": 2.0,
+                "rationale": "Test proposal",
+            })
+            db.save_signal_outcome({
+                "decision_id": dec_id,
+                "symbol": "BTC/USDT",
+                "strategy_id": "test",
+                "side": "long",
+                "entry": 50000.0,
+                "sl": 49000.0,
+                "tp": 52000.0,
+                "horizon_bars": 32,
+                "result": "TP",
+                "r_gross": 3.0,
+                "r_net": 2.8,
+                "bars_to_exit": 5,
+                "mae_r": 0.05,
+                "mfe_r": 3.0,
+                "regime": "mean_reverting",
+                "features_json": "{}",
+                "resolved_at_ms": now_ms - (i * 60000),
+            })
+
+        res3 = await reviewer.run_overnight_review()
+        assert db.get_autonomy_level() == 2, "Failed to auto-promote when criteria satisfied!"
+        assert res3.get("autonomy_promoted") is True
+
+        # Verify autonomy_log audit trail entry exists
+        log_rows = db._conn.execute("SELECT * FROM autonomy_log WHERE new_level = 2").fetchall()
+        assert len(log_rows) >= 1
+    finally:
+        db.close()
+
+
+
 
 
