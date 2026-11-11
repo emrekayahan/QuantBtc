@@ -178,6 +178,19 @@ class BinanceExchangeWrapper:
                 await self._with_backoff(lambda: self.client.load_time_difference())
         return drift_ms
 
+    async def fetch_my_trades(
+        self,
+        symbol: str,
+        since: Optional[int] = None,
+        limit: int = 50,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch user's trade history for a given symbol."""
+        await self.ensure_markets_loaded()
+        return await self._with_backoff(
+            lambda: self.client.fetch_my_trades(symbol=symbol, since=since, limit=limit, params=params or {})
+        )
+
     def amount_to_precision(self, symbol: str, amount: float) -> float:
         """Format order quantity to Binance LOT_SIZE step precision."""
         try:

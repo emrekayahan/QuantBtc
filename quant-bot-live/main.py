@@ -156,6 +156,14 @@ class AutonomousQuantEngineOrchestrator:
 
         if self.cfg_has_keys():
             try:
+                # S9: Read-only API verification test at startup
+                if hasattr(self.exchange, "fetch_my_trades"):
+                    await self.exchange.fetch_my_trades("BTC/USDT", limit=1)
+                    logger.info("Binance API read permission verified successfully.")
+            except Exception as perm_exc:
+                logger.warning("Binance API read verification note: %s", perm_exc)
+
+            try:
                 await self.reconciler.run_startup_recovery()
                 await self.reconciler.reconcile_cycle()
             except Exception as exc:

@@ -1209,6 +1209,31 @@ async def test_autonomy_auto_promotion_requires_100_samples_and_positive_ci(tmp_
         db.close()
 
 
+@pytest.mark.asyncio
+async def test_fetch_my_trades_read_only_verification(tmp_path) -> None:
+    """S9: BinanceExchangeWrapper supports fetch_my_trades for permission verification."""
+    from tests.test_idempotency import StubCCXTClient
+
+    cfg = Settings(TRADING_MODE="live", DB_PATH=str(tmp_path / "perm.db"))
+    db = DatabaseManager(db_path=cfg.DB_PATH)
+    ex = BinanceExchangeWrapper(db=db, custom_settings=cfg)
+    stub = StubCCXTClient()
+    async def mock_fetch_my_trades(symbol, since=None, limit=50, params=None):
+        return [{"id": "TR_1", "symbol": symbol, "side": "buy", "price": 50000.0, "amount": 0.01}]
+
+    stub.fetch_my_trades = mock_fetch_my_trades
+    ex.client = stub
+
+    try:
+        trades = await ex.fetch_my_trades("BTC/USDT", limit=1)
+        assert len(trades) == 1
+        assert trades[0]["id"] == "TR_1"
+        assert trades[0]["symbol"] == "BTC/USDT"
+    finally:
+        db.close()
+
+
+
 
 
 
