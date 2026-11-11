@@ -204,11 +204,50 @@ class BinanceExchangeWrapper:
         await self.ensure_markets_loaded()
         return await self._with_backoff(lambda: self.client.fetch_tickers())
 
-    async def fetch_ohlcv(self, symbol: str, timeframe: str = "15m", limit: int = 250) -> List[List[Any]]:
+    async def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "15m",
+        limit: int = 250,
+        since: Optional[int] = None,
+    ) -> List[List[Any]]:
         await self.ensure_markets_loaded()
+        kwargs: Dict[str, Any] = {"timeframe": timeframe, "limit": limit}
+        if since is not None:
+            kwargs["since"] = since
         return await self._with_backoff(
-            lambda: self.client.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            lambda: self.client.fetch_ohlcv(symbol, **kwargs)
         )
+
+    async def fetch_ohlcv_range(
+        self,
+        symbol: str,
+        timeframe: str = "15m",
+        start_ms: int = 0,
+        end_ms: int = 0,
+    ) -> List[List[Any]]:
+        """Paginate fetch_ohlcv forward in chunks of up to 1000 candles from start_ms to end_ms."""
+        await self.ensure_markets_loaded()
+        all_candles: List[List[Any]] = []
+        curr_since = start_ms
+        max_limit = 1000
+        while True:
+            batch = await self.fetch_ohlcv(symbol, timeframe=timeframe, limit=max_limit, since=curr_since)
+            if not batch:
+                break
+            for c in batch:
+                c_ts = int(c[0])
+                if end_ms > 0 and c_ts > end_ms:
+                    return all_candles
+                if not all_candles or c_ts > all_candles[-1][0]:
+                    all_candles.append(c)
+            last_ts = int(batch[-1][0])
+            if end_ms > 0 and last_ts >= end_ms:
+                break
+            if len(batch) < max_limit:
+                break
+            curr_since = last_ts + 1
+        return all_candles
 
     async def fetch_order_book(self, symbol: str, limit: int = 10) -> Dict[str, Any]:
         await self.ensure_markets_loaded()

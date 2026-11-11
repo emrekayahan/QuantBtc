@@ -50,6 +50,15 @@ class StubCCXTClient:
     async def fetch_balance(self) -> Dict[str, Any]:
         return {"free": {"USDT": 500.0, "BTC": 0.000294}, "total": {"USDT": 500.0, "BTC": 0.000294}}
 
+    async def fetch_ohlcv(
+        self, symbol: str, timeframe: str = "15m", since: Optional[int] = None, limit: int = 250
+    ) -> List[List[Any]]:
+        ts = since or 1700000000000
+        candles = []
+        for i in range(limit):
+            candles.append([ts + i * 900000, 80000.0, 82500.0, 78500.0, 81000.0, 10.0])
+        return candles
+
     async def fetch_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         return list(self.orders_by_client_id.values())
 

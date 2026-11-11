@@ -258,7 +258,14 @@ class OutcomeResolver:
                 }
                 self.db.save_signal_outcome(outcome_data)
                 resolved_count += 1
+                self.db.set_state("resolver_consecutive_errors", "0")
             except Exception as exc:
+                curr_err = int(self.db.get_state("resolver_errors") or 0) + 1
+                curr_consec = int(self.db.get_state("resolver_consecutive_errors") or 0) + 1
+                self.db.set_state("resolver_errors", str(curr_err))
+                self.db.set_state("resolver_consecutive_errors", str(curr_consec))
                 logger.warning("Could not resolve signal %s for %s: %s", d.get("id"), sym, exc)
+                if curr_consec >= 10:
+                    logger.error("OutcomeResolver has encountered %d consecutive resolution errors!", curr_consec)
 
         return resolved_count
