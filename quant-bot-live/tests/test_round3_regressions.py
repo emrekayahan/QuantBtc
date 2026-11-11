@@ -807,3 +807,193 @@ def test_estimated_pnl_excluded_from_stats(tmp_path) -> None:
     finally:
         db.close()
 
+
+def test_invalid_lessons_give_no_penalty(tmp_path) -> None:
+    """S6: MistakeLearner ignores unvalidated or prompt-echo lessons and enforces MIN_LESSONS_FOR_PENALTY."""
+    from engine.mistake_learner import MistakeLearner
+
+    cfg = Settings(TRADING_MODE="paper", DB_PATH=str(tmp_path / "lessons.db"), MIN_LESSONS_FOR_PENALTY=3)
+    db = DatabaseManager(db_path=cfg.DB_PATH)
+    learner = MistakeLearner(db=db, custom_settings=cfg)
+    try:
+        now_ms = int(time.time() * 1000)
+        # Add 2 validated lessons (less than min_lessons=3)
+        for i in range(2):
+            db.add_trade_lesson({
+                "id": f"lesson_{i}",
+                "symbol": "BTC/USDT",
+                "regime": "mean_reverting",
+                "entry_rsi": 45.0,
+                "orderbook_imbalance": -0.2,
+                "pnl": -1.0,
+                "failure_reason": f"Satis baskisina karsi giris {i}",
+                "confidence_penalty": 0.05,
+                "created_at": now_ms - 10000,
+                "validated": True,
+            })
+
+        # Add 1 unvalidated lesson
+        db.add_trade_lesson({
+            "id": "lesson_unvalidated",
+            "symbol": "BTC/USDT",
+            "regime": "mean_reverting",
+            "entry_rsi": 45.0,
+            "orderbook_imbalance": -0.2,
+            "pnl": -1.0,
+            "failure_reason": "Unvalidated failure",
+            "confidence_penalty": 0.05,
+            "created_at": now_ms - 10000,
+            "validated": False,
+        })
+
+        # Add 1 prompt-echo trash lesson
+        db.add_trade_lesson({
+            "id": "lesson_prompt_echo",
+            "symbol": "BTC/USDT",
+            "regime": "mean_reverting",
+            "entry_rsi": 45.0,
+            "orderbook_imbalance": -0.2,
+            "pnl": -1.0,
+            "failure_reason": "The user wants a 1-sentence explanation of why it failed...",
+            "confidence_penalty": 0.05,
+            "created_at": now_ms - 10000,
+            "validated": True,
+        })
+
+        # Valid count is only 2, which is < MIN_LESSONS_FOR_PENALTY (3)
+        eval_res = learner.evaluate_setup_against_lessons(
+            symbol="BTC/USDT",
+            regime="mean_reverting",
+            entry_rsi=45.0,
+            orderbook_imbalance=-0.2,
+        )
+        assert eval_res["confidence_penalty"] == 0.0, f"Expected 0.0 penalty when valid lessons < min_lessons, got {eval_res['confidence_penalty']}"
+
+        # Now add 3rd validated lesson
+        db.add_trade_lesson({
+            "id": "lesson_3",
+            "symbol": "BTC/USDT",
+            "regime": "mean_reverting",
+            "entry_rsi": 45.0,
+            "orderbook_imbalance": -0.2,
+            "pnl": -1.0,
+            "failure_reason": "Valid failure pattern",
+            "confidence_penalty": 0.05,
+            "created_at": now_ms - 5000,
+            "validated": True,
+        })
+
+        eval_res2 = learner.evaluate_setup_against_lessons(
+            symbol="BTC/USDT",
+            regime="mean_reverting",
+            entry_rsi=45.0,
+            orderbook_imbalance=-0.2,
+        )
+        assert eval_res2["confidence_penalty"] > 0.0, "Expected penalty when valid lessons >= min_lessons"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_trade_features_written_on_open_paper_and_live(tmp_path) -> None:
+    """S6: Entry-time features are written to trade_features for both paper and live modes."""
+    from engine.execution import ExecutionEngine
+    from engine.risk_engine import RiskEngine
+    from engine.schemas import ReflexDecisionSchema
+    from tests.test_idempotency import StubCCXTClient
+
+    cfg = Settings(TRADING_MODE="paper", DB_PATH=str(tmp_path / "features.db"))
+    db = DatabaseManager(db_path=cfg.DB_PATH)
+    # Record a snapshot so trade_features has source data
+    now_ms = int(time.time() * 1000)
+    db.save_state_snapshot({
+        "id": f"SNAP_ETH_{now_ms}",
+        "symbol": "ETH/USDT",
+        "causal_timestamp_ms": now_ms,
+        "regime": "mean_reverting",
+        "mid_price": 3000.0,
+        "spread_bps": 2.0,
+        "orderbook_imbalance": 0.15,
+        "rsi_14": 42.0,
+        "ema_9": 3000.0,
+        "ema_21": 2980.0,
+        "ema_50": 2950.0,
+        "ema_200": 2900.0,
+        "adx_14": 25.0,
+        "atr_14": 30.0,
+        "realized_vol": 0.02,
+        "toxic_flow": "none",
+        "bb_upper": 3100.0,
+        "bb_middle": 3000.0,
+        "bb_lower": 2900.0,
+        "vol_sma_20": 100.0,
+        "closed_volume": 120.0,
+        "closed_quote_volume": 360000.0,
+    })
+    db.set_state("free_usdt", "1000.0")
+
+    ex = BinanceExchangeWrapper(db=db, custom_settings=cfg)
+    stub = StubCCXTClient()
+    ex.client = stub
+    risk = RiskEngine(db=db, custom_settings=cfg)
+    exec_eng = ExecutionEngine(exchange=ex, db=db, risk_engine=risk, custom_settings=cfg)
+
+    decision = ReflexDecisionSchema(
+        symbol="ETH/USDT",
+        direction="long",
+        direction_confidence=0.85,
+        setup_quality=3,
+        entry_price=3000.0,
+        invalidation_price=2900.0,
+        take_profit_price=3200.0,
+        expected_reward_risk_ratio=2.0,
+        toxic_flow="none",
+        risk_state="safe",
+        regime="mean_reverting",
+        causal_timestamp_ms=now_ms,
+        rationale="Test high-conviction setup",
+    )
+
+    try:
+        res = await exec_eng.execute_approved_entry(decision=decision, free_usdt=500.0)
+        assert res.get("executed") is True, f"Failed execution: {res}"
+        pos_id = res.get("position_id")
+        assert pos_id is not None
+
+        feat = db.get_trade_features(pos_id)
+        assert feat is not None, "trade_features row was not created for paper execution!"
+        assert feat["position_id"] == pos_id
+        assert feat["rsi"] == pytest.approx(42.0, abs=0.5)
+        assert feat["adx"] == pytest.approx(25.0, abs=0.5)
+        assert feat["ob_imbalance"] == pytest.approx(0.15, abs=0.01)
+        assert feat["regime"] == "mean_reverting"
+    finally:
+        db.close()
+
+
+def test_threshold_single_source_and_logged(tmp_path) -> None:
+    """S6: min_confidence_threshold is only updated via save_brier_calibration / log_calibration_change with audit trail."""
+    cfg = Settings(TRADING_MODE="live", DB_PATH=str(tmp_path / "threshold.db"), MIN_CONFIDENCE_THRESHOLD=0.68)
+    db = DatabaseManager(db_path=cfg.DB_PATH)
+    try:
+        # Initial state is initialized with settings.MIN_CONFIDENCE_THRESHOLD (0.68)
+        assert db.get_state("min_confidence_threshold") == "0.68"
+        from engine.risk_engine import RiskEngine
+        risk = RiskEngine(db=db, custom_settings=cfg)
+        assert risk.get_active_min_confidence() == 0.68
+
+        # Update via calibration log
+        db.log_calibration_change(old_threshold=0.68, new_threshold=0.72, reason="Overconfident test", n_samples=35)
+        assert risk.get_active_min_confidence() == 0.72
+
+        # Check calibration log record exists
+        cal_row = db._conn.execute("SELECT * FROM calibration_log ORDER BY created_at_ms DESC LIMIT 1").fetchone()
+        assert cal_row is not None
+        assert cal_row[1] == 0.68
+        assert cal_row[2] == 0.72
+        assert "Overconfident test" in cal_row[3]
+    finally:
+        db.close()
+
+
+

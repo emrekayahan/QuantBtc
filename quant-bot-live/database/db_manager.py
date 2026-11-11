@@ -179,7 +179,8 @@ class DatabaseManager:
                     pnl DOUBLE NOT NULL,
                     failure_reason VARCHAR NOT NULL,
                     confidence_penalty DOUBLE NOT NULL,
-                    created_at BIGINT NOT NULL
+                    created_at BIGINT NOT NULL,
+                    validated BOOLEAN DEFAULT TRUE
                 )
                 """
             )
@@ -328,6 +329,11 @@ class DatabaseManager:
                     self._conn.execute(f"ALTER TABLE positions ADD COLUMN {col_name} {col_def}")
                 except Exception:
                     pass  # Column already exists
+
+            try:
+                self._conn.execute("ALTER TABLE trade_lessons ADD COLUMN validated BOOLEAN DEFAULT TRUE")
+            except Exception:
+                pass
             # Migrate legacy 0.80 threshold to new baseline if untouched by Brier calibration
             row_conf = self._conn.execute(
                 "SELECT value FROM system_state WHERE key = 'min_confidence_threshold'"
@@ -908,17 +914,19 @@ class DatabaseManager:
         """Persist a Stop-Loss failure lesson in the trade_lessons table."""
         now_ms = int(time.time() * 1000)
         lesson_id = str(lesson.get("id") or f"{lesson['symbol']}_{now_ms}")
+        validated = bool(lesson.get("validated", True))
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO trade_lessons (
                     id, symbol, regime, entry_rsi, orderbook_imbalance,
-                    pnl, failure_reason, confidence_penalty, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pnl, failure_reason, confidence_penalty, created_at, validated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (id) DO UPDATE SET
                     failure_reason = EXCLUDED.failure_reason,
                     confidence_penalty = EXCLUDED.confidence_penalty,
-                    created_at = EXCLUDED.created_at
+                    created_at = EXCLUDED.created_at,
+                    validated = EXCLUDED.validated
                 """,
                 [
                     lesson_id,
@@ -930,6 +938,7 @@ class DatabaseManager:
                     str(lesson.get("failure_reason", "STOP_LOSS_HIT")),
                     float(lesson.get("confidence_penalty", 0.05)),
                     int(lesson.get("created_at", now_ms)),
+                    validated,
                 ],
             )
 
@@ -937,12 +946,18 @@ class DatabaseManager:
         self,
         symbol: Optional[str] = None,
         regime: Optional[str] = None,
+        validated_only: bool = True,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
         """Fetch recent learned rules/mistakes from trade_lessons."""
-        query = "SELECT id, symbol, regime, entry_rsi, orderbook_imbalance, pnl, failure_reason, confidence_penalty, created_at FROM trade_lessons"
+        query = (
+            "SELECT id, symbol, regime, entry_rsi, orderbook_imbalance, pnl, "
+            "failure_reason, confidence_penalty, created_at, validated FROM trade_lessons"
+        )
         params: List[Any] = []
         clauses: List[str] = []
+        if validated_only:
+            clauses.append("validated = TRUE")
         if symbol:
             clauses.append("symbol = ?")
             params.append(symbol)

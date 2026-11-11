@@ -6,6 +6,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
+from config.settings import Settings, settings
 from database.db_manager import DatabaseManager
 from engine.openrouter_pool import OpenRouterPool
 
@@ -20,10 +21,12 @@ class MistakeLearner:
         db: DatabaseManager,
         openrouter_pool: Optional[OpenRouterPool] = None,
         telegram: Optional[Any] = None,
+        custom_settings: Optional[Settings] = None,
     ) -> None:
         self.db = db
         self.openrouter_pool = openrouter_pool
         self.telegram = telegram
+        self.cfg = custom_settings or settings
 
     def evaluate_setup_against_lessons(
         self,
@@ -43,13 +46,32 @@ class MistakeLearner:
             }
         """
         now_ms = int(time.time() * 1000)
-        recent_symbol_lessons = self.db.get_trade_lessons(symbol=symbol, limit=10)
+        recent_symbol_lessons = self.db.get_trade_lessons(symbol=symbol, validated_only=True, limit=10)
+
+        # Filter out any lingering prompt echoes or unvalidated lessons defensively
+        valid_lessons = []
+        for l in recent_symbol_lessons:
+            if not bool(l.get("validated", True)):
+                continue
+            f_reason = str(l.get("failure_reason") or "")
+            if "the user" in f_reason.lower() or "1-sentence" in f_reason.lower() or len(f_reason.strip()) < 15:
+                continue
+            valid_lessons.append(l)
+
+        min_lessons = int(getattr(self.cfg, "MIN_LESSONS_FOR_PENALTY", 8))
+        if len(valid_lessons) < min_lessons:
+            return {
+                "allowed": True,
+                "confidence_penalty": 0.0,
+                "reason": f"Lessons below sample threshold ({len(valid_lessons)}/{min_lessons})",
+                "matched_lessons": 0,
+            }
 
         penalty = 0.0
         matched = 0
         reasons: List[str] = []
 
-        for lesson in recent_symbol_lessons:
+        for lesson in valid_lessons:
             age_ms = now_ms - int(lesson.get("created_at", 0))
             lesson_regime = str(lesson.get("regime", ""))
             lesson_rsi = float(lesson.get("entry_rsi", 50.0))

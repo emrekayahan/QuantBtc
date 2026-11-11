@@ -264,6 +264,32 @@ class ExecutionEngine:
             )
             self.db.save_reflex_decision(decision.model_dump(), executed=True)
 
+            # R12: Record entry-time features for pristine mistake learning (paper mode)
+            try:
+                snap = self.db.get_latest_state_snapshot(decision.symbol) or {}
+                self.db.save_trade_features(
+                    {
+                        "position_id": position_id,
+                        "strategy_id": str(getattr(decision, "strategy_id", None) or decision.regime),
+                        "regime": decision.regime,
+                        "rsi": float(snap.get("rsi_14", 50.0)),
+                        "prev_rsi": float(snap.get("prev_rsi_14", 50.0)),
+                        "adx": float(snap.get("adx_14", 20.0)),
+                        "atr_pct": float(snap.get("atr_14", 1.0)) / max(fill_price, 1e-9) * 100.0,
+                        "bb_dist_pct": (fill_price - float(snap.get("bb_lower", fill_price))) / max(fill_price, 1e-9) * 100.0,
+                        "ema_dist_pct": (fill_price - float(snap.get("ema_21", fill_price))) / max(fill_price, 1e-9) * 100.0,
+                        "vol_ratio": float(snap.get("closed_volume", 1.0)) / max(float(snap.get("vol_sma_20", 1.0)), 1e-9),
+                        "ob_imbalance": float(snap.get("orderbook_imbalance", 0.0)),
+                        "spread_bps": float(snap.get("spread_bps", 0.0)),
+                        "btc_trend_state": str(self.db.get_state("macro_regime", "neutral")),
+                        "hour_utc": int(time.gmtime().tm_hour),
+                        "side": str(decision.direction),
+                        "leverage": leverage,
+                    }
+                )
+            except Exception as tf_exc:
+                logger.debug("Could not record trade features for paper %s: %s", position_id, tf_exc)
+
             # Record cash deduction in paper ledger
             if trading_mode.lower() == "futures":
                 fee_rate = getattr(self.cfg, "FUTURES_FEE_PCT", 0.05) / 100.0
