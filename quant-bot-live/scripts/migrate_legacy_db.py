@@ -155,18 +155,20 @@ def migrate_legacy_db(
                 dst_mgr.upsert_order(o_dict)
                 stats["migrated_orders"] += 1
 
-        # 5. Migrate TRADE_LESSONS (clean prompt echo)
+        # 5. Migrate TRADE_LESSONS (skip prompt-echo and trash lessons)
         if "trade_lessons" in tables:
             lesson_cols = [r[1] for r in src_conn.execute("PRAGMA table_info('trade_lessons')").fetchall()]
             lesson_rows = src_conn.execute("SELECT * FROM trade_lessons").fetchall()
             for r in lesson_rows:
                 l_dict = dict(zip(lesson_cols, r))
                 lesson_text = str(l_dict.get("lesson") or "")
+                # Completely exclude prompt-echo and trash lessons
+                if "The user wants" in lesson_text or "1-sentence" in lesson_text or len(lesson_text.strip()) < 15:
+                    logger.info("Skipping trash/prompt-echo lesson: %s", l_dict.get("lesson_id"))
+                    continue
+
                 penalty = float(l_dict.get("penalty_points") or 0.0)
                 validated = bool(l_dict.get("validated", True))
-                if "The user wants" in lesson_text or "1-sentence" in lesson_text or len(lesson_text) < 10:
-                    penalty = 0.0
-                    validated = False
 
                 dst_mgr._conn.execute(
                     """

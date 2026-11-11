@@ -202,24 +202,28 @@ class StateReconciler:
                         self.db.add_reconcile_event("I1_ORPHAN_SPOT", sym, v, resolved=False)
                         unresolved.append(v)
                 else:
-                    # Attempt to place SL first before any close!
+                    # Attempt to place SL first before any close (retry up to 3 times)
                     rearmed_sl = None
                     if self.execution is not None and px > 0.0:
-                        try:
-                            sl_price = px * 0.98
-                            rearm_id = f"QBSL_ORPHAN_{int(time.time() * 1000)}"
-                            sl_res = await self.exchange.create_order(
-                                symbol=sym,
-                                order_type="STOP_LOSS_LIMIT",
-                                side="sell",
-                                amount=amt,
-                                price=sl_price * 0.995,
-                                params={"stopPrice": sl_price, "clientOrderId": rearm_id, "newClientOrderId": rearm_id},
-                            )
-                            if sl_res and sl_res.get("id"):
-                                rearmed_sl = sl_res
-                        except Exception as sl_err:
-                            logger.warning("Could not place protective SL for orphan spot %s: %s", sym, sl_err)
+                        for attempt in range(1, 4):
+                            try:
+                                sl_price = px * 0.98
+                                rearm_id = f"QBSL_ORPHAN_{int(time.time() * 1000)}"
+                                sl_res = await self.exchange.create_order(
+                                    symbol=sym,
+                                    order_type="STOP_LOSS_LIMIT",
+                                    side="sell",
+                                    amount=amt,
+                                    price=sl_price * 0.995,
+                                    params={"stopPrice": sl_price, "clientOrderId": rearm_id, "newClientOrderId": rearm_id},
+                                )
+                                if sl_res and sl_res.get("id"):
+                                    rearmed_sl = sl_res
+                                    break
+                            except Exception as sl_err:
+                                logger.warning("Attempt %d/3: Could not place protective SL for orphan spot %s: %s", attempt, sym, sl_err)
+                                if attempt < 3:
+                                    await asyncio.sleep(0.5)
 
                     if rearmed_sl:
                         pos_id = f"ADOPTED_{sym.replace('/', '')}_{int(time.time() * 1000)}"
@@ -243,14 +247,31 @@ class StateReconciler:
                         self.db.add_reconcile_event("I1_ORPHAN_PROTECTED_AND_ADOPTED", sym, v, resolved=True)
                         resolved.append(v)
                     else:
-                        # If funds are locked in open order, do not market sell
+                        # 3 attempts to place SL failed: market close orphan if funds are not locked
                         free_amt = float(spot_bal.get("free", {}).get(asset, 0.0) or 0.0)
                         if free_amt < amt and sym_orders:
                             self.db.add_reconcile_event("I1_ORPHAN_LOCKED_IN_ORDER", sym, v, resolved=True)
                             resolved.append(v)
                         else:
-                            self.db.add_reconcile_event("I1_ORPHAN_SPOT", sym, v, resolved=False)
-                            unresolved.append(v)
+                            remediated = False
+                            if self.execution is not None:
+                                try:
+                                    c_res = await self.exchange.create_order(
+                                        symbol=sym,
+                                        order_type="market",
+                                        side="sell",
+                                        amount=amt,
+                                    )
+                                    if c_res and c_res.get("id"):
+                                        remediated = True
+                                        self.db.add_reconcile_event("I1_ORPHAN_SPOT_CLOSED", sym, c_res, resolved=True)
+                                except Exception as err:
+                                    logger.critical("Failed to close orphan spot %s after 3 SL attempts: %s", sym, err)
+                            if remediated:
+                                resolved.append(v)
+                            else:
+                                self.db.add_reconcile_event("I1_ORPHAN_SPOT", sym, v, resolved=False)
+                                unresolved.append(v)
 
         # Futures positions
         for sym, f_pos in fut_positions.items():
@@ -297,26 +318,30 @@ class StateReconciler:
                 self.db.add_reconcile_event("I1_ORPHAN_FUTURES_ADOPTED", sym, v, resolved=True)
                 resolved.append(v)
             else:
-                # Try placing SL first before closing!
+                # Try placing SL first before closing (retry up to 3 times)
                 f_sl_placed = None
                 if self.execution is not None:
-                    try:
-                        entry_px = float(f_pos.get("entryPrice") or t_map.get(sym, {}).get("last") or 0.0)
-                        f_side = "sell" if str(f_pos.get("side", "")).lower() in ("long", "buy") else "buy"
-                        stop_px = entry_px * 0.98 if f_side == "sell" else entry_px * 1.02
-                        rearm_id = f"QBSL_FUT_{int(time.time() * 1000)}"
-                        f_sl_res = await self.exchange.create_futures_order(
-                            symbol=sym,
-                            order_type="STOP_MARKET",
-                            side=f_side,
-                            amount=contracts,
-                            price=None,
-                            params={"stopPrice": stop_px, "reduceOnly": True, "clientOrderId": rearm_id},
-                        )
-                        if f_sl_res and f_sl_res.get("id"):
-                            f_sl_placed = f_sl_res
-                    except Exception as f_err:
-                        logger.warning("Could not place SL for orphan futures %s: %s", sym, f_err)
+                    entry_px = float(f_pos.get("entryPrice") or t_map.get(sym, {}).get("last") or 0.0)
+                    f_side = "sell" if str(f_pos.get("side", "")).lower() in ("long", "buy") else "buy"
+                    stop_px = entry_px * 0.98 if f_side == "sell" else entry_px * 1.02
+                    rearm_id = f"QBSL_FUT_{int(time.time() * 1000)}"
+                    for attempt in range(1, 4):
+                        try:
+                            f_sl_res = await self.exchange.create_futures_order(
+                                symbol=sym,
+                                order_type="STOP_MARKET",
+                                side=f_side,
+                                amount=contracts,
+                                price=None,
+                                params={"stopPrice": stop_px, "reduceOnly": True, "clientOrderId": rearm_id},
+                            )
+                            if f_sl_res and f_sl_res.get("id"):
+                                f_sl_placed = f_sl_res
+                                break
+                        except Exception as f_err:
+                            logger.warning("Attempt %d/3: Could not place SL for orphan futures %s: %s", attempt, sym, f_err)
+                            if attempt < 3:
+                                await asyncio.sleep(0.5)
 
                 if f_sl_placed:
                     pos_id = f"ADOPTED_FUT_{sym.replace('/', '')}_{int(time.time() * 1000)}"
