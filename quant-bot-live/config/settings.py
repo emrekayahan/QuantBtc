@@ -125,8 +125,12 @@ class Settings(BaseSettings):
         if self.DB_PATH.strip():
             return self.DB_PATH
         mode = str(self.TRADING_MODE).lower()
-        suffix = "live" if mode == "live" else "paper"
-        return str(BASE_DIR / "data" / f"quant_bot_{suffix}.db")
+        if mode == "live":
+            legacy_live = BASE_DIR / "data" / "quant_bot.db"
+            if legacy_live.exists():
+                return str(legacy_live)
+            return str(BASE_DIR / "data" / "quant_bot_live.db")
+        return str(BASE_DIR / "data" / "quant_bot_paper.db")
 
     @field_validator("TIMEFRAME")
     @classmethod

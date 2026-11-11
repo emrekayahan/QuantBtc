@@ -178,6 +178,7 @@ async def test_armed_emergency_kill_switch_halts_and_flattens(tmp_path) -> None:
                 "take_profit_price": 83000.0,
                 "quantity": 0.0003,
                 "cost_usd": 24.0,
+                "is_paper": True,
             }
         )
         risk = RiskEngine(db=db, exchange=None)

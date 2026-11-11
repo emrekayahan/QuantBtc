@@ -47,6 +47,8 @@ class BinanceExchangeWrapper:
                     "adjustForTimeDifference": True,
                     "recvWindow": 10000,
                     "fetchCurrencies": False,
+                    "warnOnFetchOpenOrdersWithoutSymbol": False,
+                    "fetchOpenOrders": {"warnWithoutSymbol": False},
                 },
             }
             if self.cfg.has_valid_binance_keys:

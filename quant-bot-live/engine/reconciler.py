@@ -210,7 +210,8 @@ class StateReconciler:
             sl_coverage_ok = False
             if active_sl_order and status != "OPEN_UNPROTECTED":
                 sl_amt = float(active_sl_order.get("amount") or 0.0)
-                if sl_amt >= exch_qty * 0.99:
+                target_qty = min(exch_qty, db_qty) if db_qty > 0 else exch_qty
+                if sl_amt >= target_qty * 0.99:
                     sl_coverage_ok = True
 
             # If no active SL or inadequate coverage (I3 / I4) or OPEN_UNPROTECTED
