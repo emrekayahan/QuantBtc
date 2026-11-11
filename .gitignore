@@ -10,6 +10,8 @@
 *.tgz
 *.zip
 *.bak
+backups/
+scratch/
 
 # Local Agent / IDE Config
 .gemini/
