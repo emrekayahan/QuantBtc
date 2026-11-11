@@ -54,18 +54,9 @@ class MistakeLearner:
             if not bool(l.get("validated", True)):
                 continue
             f_reason = str(l.get("failure_reason") or "")
-            if "the user" in f_reason.lower() or "1-sentence" in f_reason.lower() or len(f_reason.strip()) < 15:
+            if "the user" in f_reason.lower() or "1-sentence" in f_reason.lower() or len(f_reason.strip()) < 5:
                 continue
             valid_lessons.append(l)
-
-        min_lessons = int(getattr(self.cfg, "MIN_LESSONS_FOR_PENALTY", 8))
-        if len(valid_lessons) < min_lessons:
-            return {
-                "allowed": True,
-                "confidence_penalty": 0.0,
-                "reason": f"Lessons below sample threshold ({len(valid_lessons)}/{min_lessons})",
-                "matched_lessons": 0,
-            }
 
         penalty = 0.0
         matched = 0
@@ -90,7 +81,23 @@ class MistakeLearner:
                     "matched_lessons": 1,
                 }
 
-            # Apply decaying confidence penalty for similar setups within the last 48 hours
+        # Apply decaying confidence penalty for similar setups within the last 48 hours only if sample threshold met
+        min_lessons = int(getattr(self.cfg, "MIN_LESSONS_FOR_PENALTY", 8))
+        if len(valid_lessons) < min_lessons:
+            return {
+                "allowed": True,
+                "confidence_penalty": 0.0,
+                "reason": f"Lessons below sample threshold ({len(valid_lessons)}/{min_lessons})",
+                "matched_lessons": 0,
+            }
+
+        for lesson in valid_lessons:
+            age_ms = now_ms - int(lesson.get("created_at", 0))
+            lesson_regime = str(lesson.get("regime", ""))
+            lesson_rsi = float(lesson.get("entry_rsi", 50.0))
+            lesson_ob = float(lesson.get("orderbook_imbalance", 0.0))
+            lesson_pen = float(lesson.get("confidence_penalty", 0.05))
+
             if age_ms <= 48 * 3600 * 1000 and lesson_regime == regime:
                 rsi_close = abs(entry_rsi - lesson_rsi) <= 6.0
                 ob_similar = (orderbook_imbalance < 0 and lesson_ob < 0) or abs(orderbook_imbalance - lesson_ob) <= 0.15

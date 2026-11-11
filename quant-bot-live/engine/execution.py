@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from typing import Any, Dict, Optional
 
@@ -12,6 +13,7 @@ import ccxt.async_support as ccxt
 from config.settings import Settings, settings
 from database.db_manager import DatabaseManager
 from engine.exchange import BinanceExchangeWrapper
+from engine.market_router import MarketRouter
 from engine.pre_trade_analyzer import PreTradeAnalyzer
 from engine.risk_engine import RiskEngine
 from engine.schemas import ReflexDecisionSchema
@@ -37,6 +39,7 @@ class ExecutionEngine:
         self.risk_engine = risk_engine
         self.cfg = custom_settings or settings
         self.telegram = telegram
+        self.market_router = MarketRouter(db=db, custom_settings=self.cfg)
         self.pre_trade_analyzer = pre_trade_analyzer or PreTradeAnalyzer(
             db=db,
             exchange=exchange,
@@ -48,6 +51,11 @@ class ExecutionEngine:
     def build_client_order_id(symbol: str, causal_timestamp_ms: int, prefix: str = "QB") -> str:
         clean_sym = symbol.replace("/", "").replace("-", "").upper()
         return f"{prefix}_{clean_sym}_{int(causal_timestamp_ms)}"
+
+    def get_sl_limit_multiplier(self) -> float:
+        """Calculate the limit price multiplier from SL_LIMIT_BUFFER_PCT (default 0.20% buffer -> 0.998)."""
+        buffer_pct = float(getattr(self.cfg, "SL_LIMIT_BUFFER_PCT", 0.20))
+        return max(0.90, min(0.9999, 1.0 - (buffer_pct / 100.0)))
 
     async def _place_order_idempotently(
         self,
@@ -128,10 +136,44 @@ class ExecutionEngine:
         if futures_free_usdt is None:
             futures_free_usdt = float(self.db.get_state("futures_free_usdt", "0.0") or 0.0)
 
-        futures_min = float(getattr(self.cfg, "FUTURES_MIN_USDT", 5.0))
         futures_api_ok = self.db.get_state("futures_api_enabled", "true") != "false"
         effective_futures_usdt = float(futures_free_usdt) if futures_api_ok else 0.0
-        trading_mode = "FUTURES" if effective_futures_usdt >= futures_min else "SPOT"
+
+        # R15: Route market and size using MarketRouter
+        routed = self.market_router.route_market_and_size(
+            decision=decision,
+            spot_free_usdt=free_usdt,
+            futures_free_usdt=effective_futures_usdt,
+        )
+        if not routed["approved"]:
+            # Check fallback to spot when futures exhausted
+            fallback_enabled = bool(getattr(self.cfg, "FALLBACK_TO_SPOT_WHEN_FUTURES_EXHAUSTED", False))
+            if fallback_enabled and decision.direction == "long" and free_usdt >= 11.50:
+                logger.info("Futures capital exhausted; falling back to Spot execution for %s.", decision.symbol)
+                routed = {
+                    "approved": True,
+                    "market_type": "SPOT",
+                    "leverage": 1,
+                    "position_usd": min(free_usdt, float(getattr(self.cfg, "MAX_POSITION_USD", 25.0))),
+                    "margin_usd": min(free_usdt, float(getattr(self.cfg, "MAX_POSITION_USD", 25.0))),
+                    "router_reason": "Fallback to Spot when futures exhausted.",
+                }
+            else:
+                self.db.save_reflex_decision(
+                    decision.model_dump(),
+                    executed=False,
+                    market_type=routed.get("market_type", "NONE"),
+                    router_reason=routed.get("router_reason", "Market router rejected proposal"),
+                )
+                return {
+                    "executed": False,
+                    "reason": routed.get("router_reason", "Market router rejected proposal"),
+                    "decision": decision.model_dump(),
+                }
+
+        trading_mode = routed["market_type"]
+        position_usd = float(routed["position_usd"])
+        leverage = int(routed.get("leverage", 1))
 
         gate = self.risk_engine.evaluate_gate(
             decision=decision,
@@ -141,7 +183,12 @@ class ExecutionEngine:
             futures_free_usdt=effective_futures_usdt,
         )
         if not gate["approved"]:
-            self.db.save_reflex_decision(decision.model_dump(), executed=False)
+            self.db.save_reflex_decision(
+                decision.model_dump(),
+                executed=False,
+                market_type=trading_mode,
+                router_reason=gate["reason"],
+            )
             return {
                 "executed": False,
                 "reason": gate["reason"],
@@ -149,7 +196,7 @@ class ExecutionEngine:
             }
 
         position_usd = float(gate["position_usd"])
-        leverage = int(gate.get("leverage", 1))
+        leverage = int(gate.get("leverage", leverage))
         trading_mode = str(gate.get("trading_mode", trading_mode))
 
         # Step 3: Pre-Trade Deep Analysis Gate (Orderbook Imbalance + Mistake Learner + 3-bullet Telegram summary)
@@ -164,7 +211,12 @@ class ExecutionEngine:
                 send_telegram=False,
             )
             if not pre_check.get("approved", True):
-                self.db.save_reflex_decision(decision.model_dump(), executed=False)
+                self.db.save_reflex_decision(
+                    decision.model_dump(),
+                    executed=False,
+                    market_type=trading_mode,
+                    router_reason=pre_check.get("reason", "Pre-Trade Gate rejected"),
+                )
                 return {
                     "executed": False,
                     "reason": pre_check.get("reason", "Pre-Trade Gate rejected"),
@@ -192,14 +244,20 @@ class ExecutionEngine:
         if getattr(self.cfg, "is_paper", True):
             logger.info("Executing paper trade for %s in %s mode (leverage=%dx)", decision.symbol, trading_mode, leverage)
             fill_price = float(entry_price_fmt)
-            filled_qty = qty
+            partial_prob = float(getattr(self.cfg, "PAPER_PARTIAL_FILL_PROB", 0.0))
+            if partial_prob > 0.0 and random.random() < partial_prob:
+                filled_qty = self.exchange.amount_to_precision(decision.symbol, qty * 0.75)
+                logger.info("Paper simulated partial fill: %s (%.6f of %.6f)", decision.symbol, filled_qty, qty)
+            else:
+                filled_qty = qty
             cost_usd = round(filled_qty * fill_price, 4)
             margin_usd = round(cost_usd / max(leverage, 1), 4)
             exchange_order_id = f"PAPER_ENTRY_{decision.causal_timestamp_ms}"
             sl_client_id = self.build_client_order_id(decision.symbol, decision.causal_timestamp_ms, prefix="QBSL")
             sl_exchange_id = f"PAPER_SL_{decision.causal_timestamp_ms}"
+            sl_buffer_mult = self.get_sl_limit_multiplier()
             stop_price = self.exchange.price_to_precision(decision.symbol, decision.invalidation_price)
-            limit_sl_price = self.exchange.price_to_precision(decision.symbol, decision.invalidation_price * 0.997)
+            limit_sl_price = self.exchange.price_to_precision(decision.symbol, decision.invalidation_price * sl_buffer_mult)
 
             self.db.upsert_order(
                 {
@@ -464,10 +522,11 @@ class ExecutionEngine:
                                     if use_futures_client
                                     else self.exchange.price_to_precision(decision.symbol, decision.invalidation_price)
                                 )
+                                poll_buffer_mult = self.get_sl_limit_multiplier()
                                 poll_limit_p = (
-                                    self.exchange.futures_price_to_precision(decision.symbol, decision.invalidation_price * 0.997)
+                                    self.exchange.futures_price_to_precision(decision.symbol, decision.invalidation_price * poll_buffer_mult)
                                     if use_futures_client
-                                    else self.exchange.price_to_precision(decision.symbol, decision.invalidation_price * 0.997)
+                                    else self.exchange.price_to_precision(decision.symbol, decision.invalidation_price * poll_buffer_mult)
                                 )
                                 poll_sl_qty = (
                                     self.exchange.futures_amount_to_precision(decision.symbol, filled_qty)
@@ -574,13 +633,14 @@ class ExecutionEngine:
         )
 
         # Determine net fillable token balance (on Spot deduct fee / check free token; on Futures use exact contract qty)
+        sl_mult = self.get_sl_limit_multiplier()
         if use_futures_client:
             sl_qty = self.exchange.futures_amount_to_precision(decision.symbol, filled_qty)
             stop_price = self.exchange.futures_price_to_precision(
                 decision.symbol, decision.invalidation_price
             )
             limit_sl_price = self.exchange.futures_price_to_precision(
-                decision.symbol, decision.invalidation_price * 0.997
+                decision.symbol, decision.invalidation_price * sl_mult
             )
         else:
             base_asset = decision.symbol.split("/")[0]
@@ -603,7 +663,7 @@ class ExecutionEngine:
                 decision.symbol, decision.invalidation_price
             )
             limit_sl_price = self.exchange.price_to_precision(
-                decision.symbol, decision.invalidation_price * 0.997
+                decision.symbol, decision.invalidation_price * sl_mult
             )
         sl_client_id = self.build_client_order_id(
             decision.symbol, decision.causal_timestamp_ms, prefix="QBSL"
@@ -940,7 +1000,7 @@ class ExecutionEngine:
                 rearm_sl = None
                 try:
                     inval_p = float(target["invalidation_price"])
-                    limit_p = self.exchange.price_to_precision(symbol, inval_p * 0.997)
+                    limit_p = self.exchange.price_to_precision(symbol, inval_p * self.get_sl_limit_multiplier())
                     stop_p = self.exchange.price_to_precision(symbol, inval_p)
                     rearm_id = f"QBSL_REARM_{int(time.time() * 1000)}"
                     rearm_sl = await self.exchange.create_order(

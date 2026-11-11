@@ -96,6 +96,8 @@ class DatabaseManager:
                     rationale VARCHAR NOT NULL,
                     executed BOOLEAN DEFAULT FALSE,
                     outcome INTEGER,
+                    market_type VARCHAR,
+                    router_reason VARCHAR,
                     created_at_ms BIGINT NOT NULL
                 )
                 """
@@ -334,6 +336,15 @@ class DatabaseManager:
                 self._conn.execute("ALTER TABLE trade_lessons ADD COLUMN validated BOOLEAN DEFAULT TRUE")
             except Exception:
                 pass
+
+            try:
+                self._conn.execute("ALTER TABLE reflex_decisions ADD COLUMN market_type VARCHAR")
+            except Exception:
+                pass
+            try:
+                self._conn.execute("ALTER TABLE reflex_decisions ADD COLUMN router_reason VARCHAR")
+            except Exception:
+                pass
             # Migrate legacy 0.80 threshold to new baseline if untouched by Brier calibration
             row_conf = self._conn.execute(
                 "SELECT value FROM system_state WHERE key = 'min_confidence_threshold'"
@@ -526,10 +537,17 @@ class DatabaseManager:
             )
 
     def save_reflex_decision(
-        self, decision: Dict[str, Any], executed: bool = False, outcome: Optional[int] = None
+        self,
+        decision: Dict[str, Any],
+        executed: bool = False,
+        outcome: Optional[int] = None,
+        market_type: Optional[str] = None,
+        router_reason: Optional[str] = None,
     ) -> str:
         now_ms = int(time.time() * 1000)
         dec_id = f"{decision['symbol']}_{decision['causal_timestamp_ms']}"
+        m_type = market_type or decision.get("market_type")
+        r_reason = router_reason or decision.get("router_reason")
         with self._lock:
             self._conn.execute(
                 """
@@ -537,11 +555,13 @@ class DatabaseManager:
                     id, symbol, causal_timestamp_ms, regime, direction, toxic_flow,
                     setup_quality, direction_confidence, risk_state, entry_price,
                     invalidation_price, take_profit_price, expected_reward_risk_ratio,
-                    rationale, executed, outcome, created_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    rationale, executed, outcome, market_type, router_reason, created_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (id) DO UPDATE SET
                     executed = EXCLUDED.executed,
-                    outcome = COALESCE(EXCLUDED.outcome, reflex_decisions.outcome)
+                    outcome = COALESCE(EXCLUDED.outcome, reflex_decisions.outcome),
+                    market_type = COALESCE(EXCLUDED.market_type, reflex_decisions.market_type),
+                    router_reason = COALESCE(EXCLUDED.router_reason, reflex_decisions.router_reason)
                 """,
                 [
                     dec_id,
@@ -560,6 +580,8 @@ class DatabaseManager:
                     str(decision["rationale"]),
                     bool(executed),
                     outcome,
+                    m_type,
+                    r_reason,
                     now_ms,
                 ],
             )

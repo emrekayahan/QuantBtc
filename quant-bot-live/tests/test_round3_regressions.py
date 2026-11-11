@@ -817,7 +817,7 @@ def test_invalid_lessons_give_no_penalty(tmp_path) -> None:
     learner = MistakeLearner(db=db, custom_settings=cfg)
     try:
         now_ms = int(time.time() * 1000)
-        # Add 2 validated lessons (less than min_lessons=3)
+        # Add 2 validated lessons from 3 hours ago (older than 2h cooldown, within 48h penalty window)
         for i in range(2):
             db.add_trade_lesson({
                 "id": f"lesson_{i}",
@@ -828,7 +828,7 @@ def test_invalid_lessons_give_no_penalty(tmp_path) -> None:
                 "pnl": -1.0,
                 "failure_reason": f"Satis baskisina karsi giris {i}",
                 "confidence_penalty": 0.05,
-                "created_at": now_ms - 10000,
+                "created_at": now_ms - (3 * 3600 * 1000),
                 "validated": True,
             })
 
@@ -842,7 +842,7 @@ def test_invalid_lessons_give_no_penalty(tmp_path) -> None:
             "pnl": -1.0,
             "failure_reason": "Unvalidated failure",
             "confidence_penalty": 0.05,
-            "created_at": now_ms - 10000,
+            "created_at": now_ms - (3 * 3600 * 1000),
             "validated": False,
         })
 
@@ -856,7 +856,7 @@ def test_invalid_lessons_give_no_penalty(tmp_path) -> None:
             "pnl": -1.0,
             "failure_reason": "The user wants a 1-sentence explanation of why it failed...",
             "confidence_penalty": 0.05,
-            "created_at": now_ms - 10000,
+            "created_at": now_ms - (3 * 3600 * 1000),
             "validated": True,
         })
 
@@ -879,7 +879,7 @@ def test_invalid_lessons_give_no_penalty(tmp_path) -> None:
             "pnl": -1.0,
             "failure_reason": "Valid failure pattern",
             "confidence_penalty": 0.05,
-            "created_at": now_ms - 5000,
+            "created_at": now_ms - (3 * 3600 * 1000),
             "validated": True,
         })
 
@@ -994,6 +994,72 @@ def test_threshold_single_source_and_logged(tmp_path) -> None:
         assert "Overconfident test" in cal_row[3]
     finally:
         db.close()
+
+
+def test_no_dead_settings() -> None:
+    """S7: Every field in Settings is actively referenced outside config/settings.py."""
+    import glob
+    from config.settings import Settings
+
+    fields = list(Settings.model_fields.keys())
+    files = [p for p in glob.glob("**/*.py", recursive=True) if "settings.py" not in p and "venv" not in p and ".venv" not in p]
+    usage = {f: 0 for f in fields}
+    for f in fields:
+        for p in files:
+            with open(p, encoding="utf-8", errors="ignore") as fp:
+                if f in fp.read():
+                    usage[f] += 1
+
+    unused = [f for f, count in usage.items() if count == 0]
+    assert not unused, f"Found dead/unreferenced settings in Settings: {unused}"
+
+
+@pytest.mark.asyncio
+async def test_market_router_is_called_from_execution(tmp_path) -> None:
+    """S7: MarketRouter routes proposals and decision reason is saved in reflex_decisions."""
+    from engine.execution import ExecutionEngine
+    from engine.risk_engine import RiskEngine
+    from engine.schemas import ReflexDecisionSchema
+    from tests.test_idempotency import StubCCXTClient
+
+    cfg = Settings(TRADING_MODE="paper", DB_PATH=str(tmp_path / "router.db"), ENABLE_FUTURES=False)
+    db = DatabaseManager(db_path=cfg.DB_PATH)
+    ex = BinanceExchangeWrapper(db=db, custom_settings=cfg)
+    ex.client = StubCCXTClient()
+    risk = RiskEngine(db=db, custom_settings=cfg)
+    exec_eng = ExecutionEngine(exchange=ex, db=db, risk_engine=risk, custom_settings=cfg)
+
+    now_ms = int(time.time() * 1000)
+    decision = ReflexDecisionSchema(
+        symbol="BTC/USDT",
+        direction="short",
+        direction_confidence=0.85,
+        setup_quality=3,
+        entry_price=50000.0,
+        invalidation_price=51000.0,
+        take_profit_price=48000.0,
+        expected_reward_risk_ratio=2.0,
+        toxic_flow="none",
+        risk_state="safe",
+        regime="trending",
+        causal_timestamp_ms=now_ms,
+        rationale="Short signal test",
+    )
+
+    try:
+        # With ENABLE_FUTURES=False, short signal MUST be rejected by MarketRouter
+        res = await exec_eng.execute_approved_entry(decision=decision, free_usdt=100.0)
+        assert res.get("executed") is False
+        assert "no spot shorting" in res.get("reason", "").lower() or "not allowed" in res.get("reason", "").lower()
+
+        # Check reflex_decisions recorded router_reason
+        dec_row = db._conn.execute("SELECT market_type, router_reason FROM reflex_decisions WHERE symbol = 'BTC/USDT'").fetchone()
+        assert dec_row is not None
+        assert dec_row[0] == "NONE"
+        assert "short" in str(dec_row[1]).lower()
+    finally:
+        db.close()
+
 
 
 

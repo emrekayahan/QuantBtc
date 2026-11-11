@@ -41,9 +41,15 @@ class MarketRouter:
         futures_free_usdt: float,
         funding_rate_pct: float = 0.0,
     ) -> Dict[str, Any]:
-        side = getattr(decision, "side", decision.direction)
+        side = getattr(decision, "direction", getattr(decision, "side", "long"))
         is_short = str(side).lower() == "short"
         enable_futures = bool(getattr(self.cfg, "ENABLE_FUTURES", False))
+
+        # Check autonomy level against FUTURES_MIN_LEVEL
+        autonomy_level = int(self.db.get_state("autonomy_level", "0") or 0)
+        futures_min_level = int(getattr(self.cfg, "FUTURES_MIN_LEVEL", 1))
+        if autonomy_level < futures_min_level:
+            enable_futures = False
 
         # Rule 1: Shorting is ONLY supported on Futures
         if is_short and not enable_futures:

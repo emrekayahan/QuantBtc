@@ -468,12 +468,13 @@ class StateReconciler:
 
                 # Remediation: Attempt to re-arm SL immediately only if position is regular OPEN with valid inval_price
                 rearmed = False
+                sl_buf_mult = 1.0 - (float(getattr(self.cfg, "SL_LIMIT_BUFFER_PCT", 0.20)) / 100.0)
                 if self.execution is not None and inval_price > 0.0 and status != "OPEN_UNPROTECTED":
                     try:
                         rearm_id = f"QBSL_REARM_{int(time.time() * 1000)}"
                         if m_type == "futures":
                             fut_stop = self.exchange.futures_price_to_precision(sym, inval_price)
-                            fut_limit = self.exchange.futures_price_to_precision(sym, inval_price * 0.997)
+                            fut_limit = self.exchange.futures_price_to_precision(sym, inval_price * sl_buf_mult)
                             fut_qty = self.exchange.futures_amount_to_precision(sym, exch_qty)
                             new_sl = await self.exchange.create_futures_order(
                                 symbol=sym,
@@ -485,7 +486,7 @@ class StateReconciler:
                             )
                         else:
                             spot_stop = self.exchange.price_to_precision(sym, inval_price)
-                            spot_limit = self.exchange.price_to_precision(sym, inval_price * 0.997)
+                            spot_limit = self.exchange.price_to_precision(sym, inval_price * sl_buf_mult)
                             spot_qty = self.exchange.amount_to_precision(sym, exch_qty)
                             new_sl = await self.exchange.create_order(
                                 symbol=sym,
@@ -799,6 +800,26 @@ class StateReconciler:
                                     exit_reason="SERVER_SIDE_STOP_LOSS_FILLED",
                                 )
                             )
+                    elif sl_status in ("open", "untriggered", "new"):
+                        # S7: SL escalation check - if price breached invalidation_price and SL limit order remained unfilled for > SL_ESCALATION_SEC, escalate to market
+                        sl_order_ts = int(sl_info.get("timestamp") or 0)
+                        now_ms = int(time.time() * 1000)
+                        escalation_ms = float(getattr(self.cfg, "SL_ESCALATION_SEC", 20.0)) * 1000
+                        if live_price <= invalidation_price and sl_order_ts > 0 and (now_ms - sl_order_ts) >= escalation_ms:
+                            logger.warning(
+                                "SL order %s for %s has not filled after %.1fs of price breaching invalidation price (%.4f <= %.4f). Escalating to market!",
+                                sl_order_id, symbol, (now_ms - sl_order_ts) / 1000.0, live_price, invalidation_price
+                            )
+                            if self.execution is not None:
+                                try:
+                                    await self.execution.close_single_position_market(
+                                        position_id=pos_id, reason="SL_LIMIT_TIMEOUT_ESCALATED_TO_MARKET"
+                                    )
+                                    reconciled_closed += 1
+                                    sl_filled = True
+                                    continue
+                                except Exception as esc_err:
+                                    logger.error("Failed to escalate SL to market for %s: %s", pos_id, esc_err)
                 except Exception as exc:
                     logger.debug("Could not fetch SL order %s for %s: %s", sl_order_id, symbol, exc)
 

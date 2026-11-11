@@ -52,7 +52,6 @@ class Settings(BaseSettings):
     SPOT_MIN_POSITION_USD: float = Field(default=11.50, gt=0.0)
     FUTURES_MIN_USDT: float = Field(default=3.0, gt=0.0)
     FUTURES_DEFAULT_LEVERAGE: int = Field(default=3, ge=1, le=50)
-    FUTURES_MARGIN_USD: float = Field(default=4.50, gt=0.0)
     DAILY_MAX_TRADES: int = Field(default=6, ge=1, le=100)
     DAILY_MAX_LOSS_USD: float = Field(default=5.0, gt=0.0)
     MAX_DRAWDOWN_PCT: float = Field(default=15.0, gt=0.0, le=100.0)

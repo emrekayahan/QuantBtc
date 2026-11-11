@@ -161,6 +161,17 @@ class BinanceExchangeWrapper:
         drift_ms = int(server_time) - local_mid
         if self.db is not None:
             self.db.set_state("clock_drift_ms", str(drift_ms))
+
+        warn_ms = int(getattr(self.cfg, "CLOCK_WARN_MS", 250))
+        block_ms = int(getattr(self.cfg, "CLOCK_BLOCK_MS", 800))
+
+        if abs(drift_ms) >= block_ms:
+            logger.critical("Clock drift %dms exceeds CLOCK_BLOCK_MS (%dms)! Blocking entries.", drift_ms, block_ms)
+            if self.db is not None:
+                self.db.set_state("entries_blocked", "true")
+        elif abs(drift_ms) >= warn_ms:
+            logger.warning("Clock drift %dms exceeds CLOCK_WARN_MS (%dms).", drift_ms, warn_ms)
+
         if abs(drift_ms) > 1000:
             logger.warning("Clock drift exceeds 1000ms (%dms). Adjusting time difference.", drift_ms)
             if hasattr(self.client, "load_time_difference"):

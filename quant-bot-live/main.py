@@ -240,8 +240,27 @@ class AutonomousQuantEngineOrchestrator:
             return
         try:
             await self.reconciler.reconcile_cycle()
+            self.db.update_heartbeat()
         except Exception as exc:
             logger.warning("30s Reconciler job warning: %s", exc)
+
+    async def safe_watchdog_job(self) -> None:
+        """Watchdog checking loop health and entering SAFE_MODE if heartbeat lapses beyond WATCHDOG_TIMEOUT_SEC."""
+        if not getattr(settings, "SAFE_MODE_ENABLED", True):
+            return
+        last_hb = int(self.db.get_state("last_heartbeat_ms", "0") or 0)
+        now_ms = int(time.time() * 1000)
+        timeout_sec = float(getattr(settings, "WATCHDOG_TIMEOUT_SEC", 120.0))
+        if last_hb > 0 and (now_ms - last_hb) > (timeout_sec * 1000):
+            if not self.db.is_safe_mode():
+                logger.critical("Watchdog: No heartbeat for %.1fs (timeout=%.1fs)! Activating SAFE_MODE.", (now_ms - last_hb) / 1000.0, timeout_sec)
+                self.db.set_safe_mode(True, reason=f"Heartbeat timeout > {timeout_sec}s")
+                self.db.set_state("entries_blocked", "true")
+                await self.telegram.send_message(f"🚨 *WATCHDOG UYARISI: SAFE MODE AKTİF*\n\nSon kalp atışı {int((now_ms - last_hb)/1000)}s önceydi. Yeni girişler kilitlendi.")
+        else:
+            if self.db.is_safe_mode() and "Heartbeat timeout" in self.db.get_state("safe_mode_reason", ""):
+                logger.info("Watchdog: Heartbeat recovered. Restoring safe mode.")
+                self.db.set_safe_mode(False, reason="Heartbeat restored")
 
     async def safe_scanner_job(self) -> None:
         try:
@@ -286,6 +305,14 @@ class AutonomousQuantEngineOrchestrator:
             self.safe_reconcile_job,
             trigger=IntervalTrigger(seconds=30),
             id="reconciler_30s",
+            replace_existing=True,
+            max_instances=1,
+        )
+        # 1b. 30-second Watchdog check for engine health & heartbeat
+        self.scheduler.add_job(
+            self.safe_watchdog_job,
+            trigger=IntervalTrigger(seconds=30),
+            id="watchdog_30s",
             replace_existing=True,
             max_instances=1,
         )
