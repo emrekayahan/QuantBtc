@@ -149,7 +149,9 @@ class DatabaseManager:
                     margin_usd DOUBLE DEFAULT 0.0,
                     notional_usd DOUBLE DEFAULT 0.0,
                     sl_slippage_pct DOUBLE DEFAULT 0.0,
-                    is_paper BOOLEAN DEFAULT FALSE
+                    is_paper BOOLEAN DEFAULT FALSE,
+                    adopted BOOLEAN DEFAULT FALSE,
+                    pnl_estimated BOOLEAN DEFAULT FALSE
                 )
                 """
             )
@@ -318,6 +320,8 @@ class DatabaseManager:
                 ("notional_usd", "DOUBLE DEFAULT 0.0"),
                 ("sl_slippage_pct", "DOUBLE DEFAULT 0.0"),
                 ("is_paper", "BOOLEAN DEFAULT FALSE"),
+                ("adopted", "BOOLEAN DEFAULT FALSE"),
+                ("pnl_estimated", "BOOLEAN DEFAULT FALSE"),
             ]
             for col_name, col_def in new_pos_cols:
                 try:
@@ -614,8 +618,9 @@ class DatabaseManager:
                     invalidation_price, take_profit_price, quantity, cost_usd,
                     unrealized_pnl_usd, realized_pnl_usd, direction_confidence,
                     setup_quality, regime, opened_at_ms,
-                    market_type, leverage, margin_usd, notional_usd, sl_slippage_pct, is_paper
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 0.0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    market_type, leverage, margin_usd, notional_usd, sl_slippage_pct, is_paper,
+                    adopted, pnl_estimated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 0.0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (position_id) DO UPDATE SET
                     status = EXCLUDED.status,
                     sl_client_order_id = COALESCE(EXCLUDED.sl_client_order_id, positions.sl_client_order_id),
@@ -627,7 +632,9 @@ class DatabaseManager:
                     margin_usd = EXCLUDED.margin_usd,
                     notional_usd = EXCLUDED.notional_usd,
                     sl_slippage_pct = EXCLUDED.sl_slippage_pct,
-                    is_paper = EXCLUDED.is_paper
+                    is_paper = EXCLUDED.is_paper,
+                    adopted = EXCLUDED.adopted,
+                    pnl_estimated = EXCLUDED.pnl_estimated
                 """,
                 [
                     str(pos["position_id"]),
@@ -653,6 +660,8 @@ class DatabaseManager:
                     float(pos.get("notional_usd", pos["cost_usd"])),
                     float(pos.get("sl_slippage_pct", 0.0)),
                     bool(pos.get("is_paper", False)),
+                    bool(pos.get("adopted", False)),
+                    bool(pos.get("pnl_estimated", False)),
                 ],
             )
 

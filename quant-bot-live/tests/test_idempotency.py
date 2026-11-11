@@ -59,8 +59,13 @@ class StubCCXTClient:
             candles.append([ts + i * 900000, 80000.0, 82500.0, 78500.0, 81000.0, 10.0])
         return candles
 
-    async def fetch_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def fetch_open_orders(
+        self, symbol: Optional[str] = None, params: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
         return list(self.orders_by_client_id.values())
+
+    async def fetch_positions(self, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        return []
 
     async def create_order(
         self,

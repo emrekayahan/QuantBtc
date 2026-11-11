@@ -295,3 +295,156 @@ async def test_orphan_spot_with_existing_sl_is_adopted_no_critical(tmp_path) -> 
         assert pos.get("sl_exchange_order_id") == "68339261149"
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_orphan_futures_with_existing_algo_sl_is_adopted_not_closed(tmp_path) -> None:
+    """S2: Verify orphan futures position with active SL order is adopted into DB, not closed."""
+    cfg = Settings(TRADING_MODE="live", BINANCE_API_KEY="k", BINANCE_API_SECRET="s", DB_PATH=str(tmp_path / "fut_adopt.db"))
+    db = DatabaseManager(db_path=cfg.DB_PATH)
+    try:
+        class FutOrphanStub(StubCCXTClient):
+            def __init__(self):
+                super().__init__()
+                self.created_orders = []
+
+            async def fetch_balance(self):
+                return {"free": {"USDT": 100.0}, "total": {"USDT": 100.0}}
+
+            async def fetch_active_futures_positions(self):
+                return {
+                    "BTC/USDT": {
+                        "symbol": "BTC/USDT",
+                        "contracts": 0.005,
+                        "entryPrice": 80000.0,
+                        "side": "long",
+                        "leverage": 10,
+                        "initialMargin": 40.0,
+                        "notional": 400.0,
+                    }
+                }
+
+            async def fetch_positions(self, symbols=None):
+                return [
+                    {
+                        "symbol": "BTC/USDT:USDT",
+                        "contracts": 0.005,
+                        "entryPrice": 80000.0,
+                        "side": "long",
+                        "leverage": 10,
+                        "initialMargin": 40.0,
+                        "notional": 400.0,
+                    }
+                ]
+
+            async def fetch_open_orders(self, symbol=None, params=None):
+                return [
+                    {
+                        "id": "fut_sl_999",
+                        "symbol": "BTC/USDT",
+                        "type": "STOP_MARKET",
+                        "side": "sell",
+                        "amount": 0.005,
+                        "stopPrice": 78400.0,
+                        "reduceOnly": True,
+                        "status": "open",
+                    }
+                ]
+
+            async def create_futures_order(self, *args, **kwargs):
+                self.created_orders.append(kwargs)
+                return {"id": "fut_close_1"}
+
+        stub = FutOrphanStub()
+        ex = BinanceExchangeWrapper(db=db, custom_settings=cfg, ccxt_client=stub)
+        ex.futures_client = stub
+        reconciler = StateReconciler(db=db, exchange=ex, custom_settings=cfg)
+
+        res = await reconciler.audit_and_reconcile_invariants()
+        assert res["entries_blocked"] is False
+        assert len(stub.created_orders) == 0, "Futures position with existing SL must NOT be closed"
+
+        open_positions = db.get_open_positions()
+        assert len(open_positions) == 1
+        pos = open_positions[0]
+        assert pos["symbol"] == "BTC/USDT"
+        assert pos["market_type"] == "futures"
+        assert pos.get("adopted") is True
+        assert pos.get("sl_exchange_order_id") == "fut_sl_999"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_orphan_without_sl_gets_sl_before_any_close(tmp_path) -> None:
+    """S2: Verify orphan without existing SL attempts to place protective SL before any market close."""
+    cfg = Settings(TRADING_MODE="live", BINANCE_API_KEY="k", BINANCE_API_SECRET="s", DB_PATH=str(tmp_path / "sl_first.db"))
+    db = DatabaseManager(db_path=cfg.DB_PATH)
+    try:
+        class UnprotectedOrphanStub(StubCCXTClient):
+            def __init__(self):
+                super().__init__()
+                self.orders = []
+
+            async def fetch_balance(self):
+                return {"free": {"ETH": 0.1, "USDT": 10.0}, "total": {"ETH": 0.1, "USDT": 10.0}}
+
+            async def fetch_tickers(self):
+                return {"ETH/USDT": {"last": 3000.0, "close": 3000.0}}
+
+            async def fetch_open_orders(self, symbol=None, params=None):
+                return []
+
+            async def create_order(self, symbol, order_type, side, amount, price=None, params=None, client_order_id=None):
+                order = {"id": "new_sl_123", "type": order_type, "side": side, "amount": amount, "price": price}
+                self.orders.append(order)
+                return order
+
+        stub = UnprotectedOrphanStub()
+        ex = BinanceExchangeWrapper(db=db, custom_settings=cfg, ccxt_client=stub)
+        from engine.risk_engine import RiskEngine
+        from engine.execution import ExecutionEngine
+        risk = RiskEngine(db=db, custom_settings=cfg)
+        execution = ExecutionEngine(exchange=ex, db=db, risk_engine=risk, custom_settings=cfg)
+        reconciler = StateReconciler(db=db, exchange=ex, execution=execution, custom_settings=cfg)
+
+        res = await reconciler.audit_and_reconcile_invariants()
+        assert res["entries_blocked"] is False
+        assert len(stub.orders) == 1
+        assert "STOP" in stub.orders[0]["type"]
+        assert stub.orders[0]["side"] == "sell"
+
+        open_positions = db.get_open_positions()
+        assert len(open_positions) == 1
+        assert open_positions[0]["symbol"] == "ETH/USDT"
+        assert open_positions[0]["adopted"] is True
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_dust_below_min_notional_is_ignored_once(tmp_path) -> None:
+    """S2: Verify orphan token below dust_max is recorded as DUST_IGNORED without blocking entries."""
+    cfg = Settings(TRADING_MODE="live", BINANCE_API_KEY="k", BINANCE_API_SECRET="s", DB_PATH=str(tmp_path / "dust.db"), DUST_MAX_USD=0.50)
+    db = DatabaseManager(db_path=cfg.DB_PATH)
+    try:
+        class DustStub(StubCCXTClient):
+            async def fetch_balance(self):
+                return {"free": {"TRX": 1.0, "USDT": 10.0}, "total": {"TRX": 1.0, "USDT": 10.0}}
+
+            async def fetch_tickers(self):
+                return {"TRX/USDT": {"last": 0.15, "close": 0.15}}  # 1.0 * 0.15 = 0.15 USD < 0.50
+
+            async def fetch_open_orders(self, symbol=None, params=None):
+                return []
+
+        stub = DustStub()
+        ex = BinanceExchangeWrapper(db=db, custom_settings=cfg, ccxt_client=stub)
+        reconciler = StateReconciler(db=db, exchange=ex, custom_settings=cfg)
+
+        res = await reconciler.audit_and_reconcile_invariants()
+        assert res["entries_blocked"] is False
+        events = db.get_reconcile_events()
+        assert any(e["event_type"] == "I1_ORPHAN_DUST_IGNORED" for e in events)
+    finally:
+        db.close()

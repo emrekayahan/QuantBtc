@@ -411,9 +411,32 @@ class BinanceExchangeWrapper:
             fut_symbol, order_type, side, fmt_amount, fmt_price, extra_params
         )
 
-    async def fetch_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def fetch_open_orders(
+        self, symbol: Optional[str] = None, params: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
         await self.ensure_markets_loaded()
-        return await self._with_backoff(lambda: self.client.fetch_open_orders(symbol), clear_auth_banner=True)
+        p = params or {}
+        return await self._with_backoff(
+            lambda: self.client.fetch_open_orders(symbol, params=p) if p else self.client.fetch_open_orders(symbol),
+            clear_auth_banner=True,
+        )
+
+    async def fetch_futures_open_orders(
+        self, symbol: Optional[str] = None, params: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        if self.futures_client is None:
+            return []
+        await self.ensure_futures_markets_loaded()
+        fut_symbol = self.resolve_futures_symbol(symbol) if symbol else None
+        p = params or {}
+        try:
+            return await self._with_backoff(
+                lambda: self.futures_client.fetch_open_orders(fut_symbol, params=p) if p else self.futures_client.fetch_open_orders(fut_symbol),
+                clear_auth_banner=True,
+            )
+        except Exception as exc:
+            logger.debug("Could not fetch futures open orders: %s", exc)
+            return []
 
     async def fetch_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
         await self.ensure_markets_loaded()

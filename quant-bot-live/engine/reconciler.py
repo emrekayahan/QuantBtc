@@ -57,7 +57,12 @@ class StateReconciler:
         unresolved: List[Dict[str, Any]] = []
 
         dust_max = float(getattr(self.cfg, "DUST_MAX_USD", 0.50))
-        t_map = tickers or {}
+        t_map = dict(tickers or {})
+        if not t_map and hasattr(self.exchange, "fetch_tickers"):
+            try:
+                t_map = await self.exchange.fetch_tickers()
+            except Exception as exc:
+                logger.warning("Reconciler failed to fetch tickers: %s", exc)
 
         # 1. Gather exchange state
         spot_bal = {}
@@ -73,11 +78,42 @@ class StateReconciler:
             except Exception as exc:
                 logger.warning("Reconciler failed to fetch active futures positions: %s", exc)
 
+        # 2. Gather DB state
+        db_positions = self.db.get_open_positions(include_unprotected=True)
+        db_pos_by_sym = {p["symbol"]: p for p in db_positions}
+
+        # Collect candidate symbols to query open orders per-symbol
+        candidate_symbols = set(db_pos_by_sym.keys())
+        free_totals = spot_bal.get("total", {}) if isinstance(spot_bal, dict) else {}
+        for asset, total_amt in free_totals.items():
+            if float(total_amt or 0) > 0 and asset not in ("USDT", "BUSD", "USDC", "FDUSD", "BNB"):
+                candidate_symbols.add(f"{asset}/USDT")
+        candidate_symbols.update(fut_positions.keys())
+
         open_orders: List[Dict[str, Any]] = []
-        try:
-            open_orders = await self.exchange.fetch_open_orders()
-        except Exception as exc:
-            logger.warning("Reconciler failed to fetch open orders: %s", exc)
+        if candidate_symbols:
+            for s in candidate_symbols:
+                try:
+                    s_orders = await self.exchange.fetch_open_orders(s)
+                    if s_orders:
+                        open_orders.extend(s_orders)
+                except Exception as exc:
+                    logger.debug("Failed to fetch open orders for symbol %s: %s", s, exc)
+                if hasattr(self.exchange, "fetch_futures_open_orders") and getattr(self.exchange, "futures_client", None) is not None:
+                    try:
+                        f_orders = await self.exchange.fetch_futures_open_orders(s, params={"stop": True})
+                        if f_orders:
+                            open_orders.extend(f_orders)
+                        f_std = await self.exchange.fetch_futures_open_orders(s)
+                        if f_std:
+                            open_orders.extend(f_std)
+                    except Exception as exc:
+                        logger.debug("Failed to fetch futures open orders for %s: %s", s, exc)
+        else:
+            try:
+                open_orders = await self.exchange.fetch_open_orders()
+            except Exception as exc:
+                logger.warning("Reconciler failed to fetch open orders: %s", exc)
 
         # Map open orders by symbol & type
         open_orders_by_sym: Dict[str, List[Dict[str, Any]]] = {}
@@ -85,15 +121,10 @@ class StateReconciler:
             sym = o.get("symbol") or ""
             open_orders_by_sym.setdefault(sym, []).append(o)
 
-        # 2. Gather DB state
-        db_positions = self.db.get_open_positions(include_unprotected=True)
-        db_pos_by_sym = {p["symbol"]: p for p in db_positions}
-
         # ------------------------------------------------------------------
         # INVARIANT I1: Orphan Position (Exchange holds assets, DB has no open position)
         # ------------------------------------------------------------------
         # Spot tokens
-        free_totals = spot_bal.get("total", {}) if isinstance(spot_bal, dict) else {}
         for asset, total_amt in free_totals.items():
             amt = float(total_amt or 0.0)
             if amt <= 0.0 or asset in ("USDT", "BUSD", "USDC", "FDUSD", "BNB"):
@@ -101,57 +132,239 @@ class StateReconciler:
             sym = f"{asset}/USDT"
             px = float(t_map.get(sym, {}).get("last") or t_map.get(sym, {}).get("close") or 0.0)
             val_usd = amt * px
-            if val_usd > dust_max and sym not in db_pos_by_sym:
+            if sym not in db_pos_by_sym:
+                if val_usd <= dust_max:
+                    # Dust position: ignore and do not block entries
+                    v = {"invariant": "I1", "type": "orphan_spot_dust", "symbol": sym, "amount": amt, "val_usd": val_usd}
+                    self.db.add_reconcile_event("I1_ORPHAN_DUST_IGNORED", sym, v, resolved=True)
+                    resolved.append(v)
+                    logger.info("Orphan spot for %s is dust ($%.2f <= $%.2f), ignoring.", sym, val_usd, dust_max)
+                    continue
+
                 v = {"invariant": "I1", "type": "orphan_spot", "symbol": sym, "amount": amt, "val_usd": val_usd}
                 violations.append(v)
-                self.db.add_reconcile_event("I1_ORPHAN_SPOT", sym, v, resolved=False)
 
-                # Attempt remediation: try placing SL or market-sell
-                remediated = False
-                if self.execution is not None and px > 0.0:
-                    try:
-                        # Attempt emergency market sell or SL
-                        sell_res = await self.exchange.create_market_sell_order(sym, amt)
-                        if sell_res and sell_res.get("id"):
-                            remediated = True
-                            self.db.add_reconcile_event("I1_ORPHAN_SPOT_CLOSED", sym, sell_res, resolved=True)
-                    except Exception as err:
-                        logger.critical("Failed to remediate I1 orphan spot for %s: %s", sym, err)
+                # Check if an active protective SL order already exists on exchange
+                sym_orders = open_orders_by_sym.get(sym, [])
+                existing_sl = None
+                for o in sym_orders:
+                    o_type = str(o.get("type", "")).upper()
+                    o_side = str(o.get("side", "")).lower()
+                    o_amt = float(o.get("amount") or 0.0)
+                    if o_side == "sell" and "STOP" in o_type and o_amt >= amt * 0.99:
+                        existing_sl = o
+                        break
 
-                if remediated:
+                if existing_sl:
+                    # ADOPT POSITION: Existing SL covers position, no new orders needed
+                    sl_price = float(existing_sl.get("stopPrice") or existing_sl.get("price") or (px * 0.98))
+                    pos_id = f"ADOPTED_{sym.replace('/', '')}_{int(time.time() * 1000)}"
+                    self.db.open_position({
+                        "position_id": pos_id,
+                        "symbol": sym,
+                        "entry_client_order_id": f"QB_ADOPTED_{sym.replace('/', '')}",
+                        "entry_price": px,
+                        "current_price": px,
+                        "invalidation_price": sl_price,
+                        "take_profit_price": px * 1.03,
+                        "quantity": amt,
+                        "cost_usd": val_usd,
+                        "market_type": "spot",
+                        "sl_exchange_order_id": str(existing_sl.get("id")),
+                        "sl_client_order_id": str(existing_sl.get("clientOrderId") or f"QBSL_{existing_sl.get('id')}"),
+                        "direction_confidence": 0.75,
+                        "is_paper": False,
+                        "adopted": True,
+                    })
+                    self.db.add_reconcile_event("I1_ORPHAN_ADOPTED", sym, {"symbol": sym, "amount": amt, "sl_order_id": str(existing_sl.get("id"))}, resolved=True)
                     resolved.append(v)
+                    logger.info("Adopted orphan spot position for %s (amount: %s) with existing SL %s", sym, amt, existing_sl.get("id"))
+                elif getattr(self.cfg, "RECONCILE_ORPHAN_CLOSE_MARKET", False):
+                    # Configured for explicit immediate market close
+                    remediated = False
+                    if self.execution is not None:
+                        try:
+                            c_res = await self.exchange.create_order(
+                                symbol=sym,
+                                order_type="market",
+                                side="sell",
+                                amount=amt,
+                            )
+                            if c_res and c_res.get("id"):
+                                remediated = True
+                                self.db.add_reconcile_event("I1_ORPHAN_SPOT_CLOSED", sym, c_res, resolved=True)
+                        except Exception as err:
+                            logger.critical("Failed to close orphan spot %s: %s", sym, err)
+                    if remediated:
+                        resolved.append(v)
+                    else:
+                        self.db.add_reconcile_event("I1_ORPHAN_SPOT", sym, v, resolved=False)
+                        unresolved.append(v)
                 else:
-                    unresolved.append(v)
+                    # Attempt to place SL first before any close!
+                    rearmed_sl = None
+                    if self.execution is not None and px > 0.0:
+                        try:
+                            sl_price = px * 0.98
+                            rearm_id = f"QBSL_ORPHAN_{int(time.time() * 1000)}"
+                            sl_res = await self.exchange.create_order(
+                                symbol=sym,
+                                order_type="STOP_LOSS_LIMIT",
+                                side="sell",
+                                amount=amt,
+                                price=sl_price * 0.995,
+                                params={"stopPrice": sl_price, "clientOrderId": rearm_id, "newClientOrderId": rearm_id},
+                            )
+                            if sl_res and sl_res.get("id"):
+                                rearmed_sl = sl_res
+                        except Exception as sl_err:
+                            logger.warning("Could not place protective SL for orphan spot %s: %s", sym, sl_err)
+
+                    if rearmed_sl:
+                        pos_id = f"ADOPTED_{sym.replace('/', '')}_{int(time.time() * 1000)}"
+                        self.db.open_position({
+                            "position_id": pos_id,
+                            "symbol": sym,
+                            "entry_client_order_id": f"QB_ADOPTED_{sym.replace('/', '')}",
+                            "entry_price": px,
+                            "current_price": px,
+                            "invalidation_price": px * 0.98,
+                            "take_profit_price": px * 1.03,
+                            "quantity": amt,
+                            "cost_usd": val_usd,
+                            "market_type": "spot",
+                            "sl_exchange_order_id": str(rearmed_sl.get("id")),
+                            "sl_client_order_id": str(rearmed_sl.get("clientOrderId") or rearm_id),
+                            "direction_confidence": 0.75,
+                            "is_paper": False,
+                            "adopted": True,
+                        })
+                        self.db.add_reconcile_event("I1_ORPHAN_PROTECTED_AND_ADOPTED", sym, v, resolved=True)
+                        resolved.append(v)
+                    else:
+                        # If funds are locked in open order, do not market sell
+                        free_amt = float(spot_bal.get("free", {}).get(asset, 0.0) or 0.0)
+                        if free_amt < amt and sym_orders:
+                            self.db.add_reconcile_event("I1_ORPHAN_LOCKED_IN_ORDER", sym, v, resolved=True)
+                            resolved.append(v)
+                        else:
+                            self.db.add_reconcile_event("I1_ORPHAN_SPOT", sym, v, resolved=False)
+                            unresolved.append(v)
 
         # Futures positions
         for sym, f_pos in fut_positions.items():
             contracts = abs(float(f_pos.get("contracts") or 0.0))
-            if contracts > 0.0 and sym not in db_pos_by_sym:
-                v = {"invariant": "I1", "type": "orphan_futures", "symbol": sym, "contracts": contracts}
-                violations.append(v)
-                self.db.add_reconcile_event("I1_ORPHAN_FUTURES", sym, v, resolved=False)
+            if contracts <= 0.0 or sym in db_pos_by_sym:
+                continue
+            v = {"invariant": "I1", "type": "orphan_futures", "symbol": sym, "contracts": contracts}
+            violations.append(v)
 
-                remediated = False
+            # Check if active algo / stop order exists for this futures position
+            existing_f_sl = None
+            sym_orders = open_orders_by_sym.get(sym, [])
+            for o in sym_orders:
+                o_type = str(o.get("type", "")).upper()
+                if o.get("reduceOnly") or o.get("closePosition") or "STOP" in o_type:
+                    existing_f_sl = o
+                    break
+
+            if existing_f_sl:
+                # ADOPT FUTURES POSITION
+                entry_px = float(f_pos.get("entryPrice") or t_map.get(sym, {}).get("last") or 0.0)
+                sl_px = float(existing_f_sl.get("stopPrice") or existing_f_sl.get("price") or (entry_px * 0.98))
+                pos_id = f"ADOPTED_FUT_{sym.replace('/', '')}_{int(time.time() * 1000)}"
+                self.db.open_position({
+                    "position_id": pos_id,
+                    "symbol": sym,
+                    "entry_client_order_id": f"QB_ADOPTED_FUT_{sym.replace('/', '')}",
+                    "entry_price": entry_px,
+                    "current_price": entry_px,
+                    "invalidation_price": sl_px,
+                    "take_profit_price": entry_px * 1.03,
+                    "quantity": contracts,
+                    "cost_usd": float(f_pos.get("notional") or (contracts * entry_px)),
+                    "market_type": "futures",
+                    "leverage": int(f_pos.get("leverage") or 1),
+                    "margin_usd": float(f_pos.get("initialMargin") or 0.0),
+                    "notional_usd": float(f_pos.get("notional") or (contracts * entry_px)),
+                    "sl_exchange_order_id": str(existing_f_sl.get("id")),
+                    "sl_client_order_id": str(existing_f_sl.get("clientOrderId") or f"QBSL_{existing_f_sl.get('id')}"),
+                    "direction_confidence": 0.75,
+                    "is_paper": False,
+                    "adopted": True,
+                })
+                self.db.add_reconcile_event("I1_ORPHAN_FUTURES_ADOPTED", sym, v, resolved=True)
+                resolved.append(v)
+            else:
+                # Try placing SL first before closing!
+                f_sl_placed = None
                 if self.execution is not None:
                     try:
-                        c_res = await self.exchange.create_futures_order(
+                        entry_px = float(f_pos.get("entryPrice") or t_map.get(sym, {}).get("last") or 0.0)
+                        f_side = "sell" if str(f_pos.get("side", "")).lower() in ("long", "buy") else "buy"
+                        stop_px = entry_px * 0.98 if f_side == "sell" else entry_px * 1.02
+                        rearm_id = f"QBSL_FUT_{int(time.time() * 1000)}"
+                        f_sl_res = await self.exchange.create_futures_order(
                             symbol=sym,
-                            order_type="market",
-                            side="sell",
+                            order_type="STOP_MARKET",
+                            side=f_side,
                             amount=contracts,
                             price=None,
-                            params={"reduceOnly": True},
+                            params={"stopPrice": stop_px, "reduceOnly": True, "clientOrderId": rearm_id},
                         )
-                        if c_res and c_res.get("id"):
-                            remediated = True
-                            self.db.add_reconcile_event("I1_ORPHAN_FUTURES_CLOSED", sym, c_res, resolved=True)
-                    except Exception as err:
-                        logger.critical("Failed to remediate I1 orphan futures for %s: %s", sym, err)
+                        if f_sl_res and f_sl_res.get("id"):
+                            f_sl_placed = f_sl_res
+                    except Exception as f_err:
+                        logger.warning("Could not place SL for orphan futures %s: %s", sym, f_err)
 
-                if remediated:
+                if f_sl_placed:
+                    pos_id = f"ADOPTED_FUT_{sym.replace('/', '')}_{int(time.time() * 1000)}"
+                    self.db.open_position({
+                        "position_id": pos_id,
+                        "symbol": sym,
+                        "entry_client_order_id": f"QB_ADOPTED_FUT_{sym.replace('/', '')}",
+                        "entry_price": entry_px,
+                        "current_price": entry_px,
+                        "invalidation_price": stop_px,
+                        "take_profit_price": entry_px * 1.03,
+                        "quantity": contracts,
+                        "cost_usd": float(f_pos.get("notional") or (contracts * entry_px)),
+                        "market_type": "futures",
+                        "leverage": int(f_pos.get("leverage") or 1),
+                        "margin_usd": float(f_pos.get("initialMargin") or 0.0),
+                        "notional_usd": float(f_pos.get("notional") or (contracts * entry_px)),
+                        "sl_exchange_order_id": str(f_sl_placed.get("id")),
+                        "sl_client_order_id": str(f_sl_placed.get("clientOrderId") or rearm_id),
+                        "direction_confidence": 0.75,
+                        "is_paper": False,
+                        "adopted": True,
+                    })
+                    self.db.add_reconcile_event("I1_ORPHAN_FUTURES_PROTECTED_AND_ADOPTED", sym, v, resolved=True)
                     resolved.append(v)
                 else:
-                    unresolved.append(v)
+                    # SL placement failed; only now market close with reduceOnly
+                    remediated = False
+                    if self.execution is not None:
+                        try:
+                            c_res = await self.exchange.create_futures_order(
+                                symbol=sym,
+                                order_type="market",
+                                side="sell" if str(f_pos.get("side", "")).lower() in ("long", "buy") else "buy",
+                                amount=contracts,
+                                price=None,
+                                params={"reduceOnly": True},
+                            )
+                            if c_res and c_res.get("id"):
+                                remediated = True
+                                self.db.add_reconcile_event("I1_ORPHAN_FUTURES_CLOSED", sym, c_res, resolved=True)
+                        except Exception as err:
+                            logger.critical("Failed to remediate I1 orphan futures for %s: %s", sym, err)
+
+                    if remediated:
+                        resolved.append(v)
+                    else:
+                        self.db.add_reconcile_event("I1_ORPHAN_FUTURES", sym, v, resolved=False)
+                        unresolved.append(v)
 
         # ------------------------------------------------------------------
         # INVARIANTS I2, I3, I4: Inspect each DB open position against exchange

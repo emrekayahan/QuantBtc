@@ -603,6 +603,7 @@ async def test_r4_i1_orphan_position_gets_market_closed(tmp_path) -> None:
         BINANCE_API_SECRET="valid_live_secret_12345",
         DB_PATH=str(tmp_path / "r4_i1.db"),
         DUST_MAX_USD=0.50,
+        RECONCILE_ORPHAN_CLOSE_MARKET=True,
     )
     db = DatabaseManager(db_path=cfg.DB_PATH)
     try:

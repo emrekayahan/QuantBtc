@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     ENTRY_ORDER_TTL_SEC: float = Field(default=90.0, ge=0.0, le=900.0)
     ENTRY_ORDER_POLL_SEC: float = Field(default=2.0, ge=0.0, le=30.0)
     DUST_MAX_USD: float = Field(default=0.50, ge=0.0)
+    RECONCILE_ORPHAN_CLOSE_MARKET: bool = Field(default=False)
     SL_LIMIT_BUFFER_PCT: float = Field(default=0.20, ge=0.0, le=5.0)
     SL_ESCALATION_SEC: float = Field(default=20.0, ge=1.0, le=300.0)
 
