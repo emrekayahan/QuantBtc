@@ -448,3 +448,200 @@ async def test_dust_below_min_notional_is_ignored_once(tmp_path) -> None:
         assert any(e["event_type"] == "I1_ORPHAN_DUST_IGNORED" for e in events)
     finally:
         db.close()
+
+
+def test_single_db_path_source(tmp_path) -> None:
+    """S4: Verify Settings is the single deterministic source of DB paths."""
+    s_live = Settings(TRADING_MODE="live", DB_PATH="")
+    assert s_live.effective_db_path.endswith("quant_bot_live.db")
+
+    s_paper = Settings(TRADING_MODE="paper", DB_PATH="")
+    assert s_paper.effective_db_path.endswith("quant_bot_paper.db")
+
+    s_custom = Settings(TRADING_MODE="live", DB_PATH=str(tmp_path / "custom.db"))
+    assert s_custom.effective_db_path == str(tmp_path / "custom.db")
+
+
+def test_legacy_db_with_open_positions_blocks_start(tmp_path) -> None:
+    """S4: If data/quant_bot.db exists with open positions, startup safety blocks start."""
+    from scripts.migrate_legacy_db import check_startup_safety
+
+    legacy_db_path = tmp_path / "quant_bot.db"
+    legacy_db = DatabaseManager(db_path=str(legacy_db_path))
+    legacy_db.open_position({
+        "position_id": "LEGACY_POS_1",
+        "symbol": "BTC/USDT",
+        "entry_price": 60000.0,
+        "current_price": 60000.0,
+        "quantity": 0.01,
+        "cost_usd": 600.0,
+        "status": "OPEN",
+    })
+    legacy_db.close()
+
+    cfg = Settings(TRADING_MODE="live", DB_PATH=str(tmp_path / "quant_bot_live.db"))
+    with pytest.raises(RuntimeError, match="LEGACY_DB_DETECTED"):
+        check_startup_safety(cfg, legacy_db_path=str(legacy_db_path))
+
+
+def test_migration_is_idempotent_and_backs_up(tmp_path) -> None:
+    """S4: Migration script creates pre-migration backup and is safely re-runnable."""
+    from scripts.migrate_legacy_db import migrate_legacy_db
+
+    src_path = tmp_path / "quant_bot.db"
+    dst_path = tmp_path / "quant_bot_live.db"
+    backup_dir = tmp_path / "backups"
+
+    src_db = DatabaseManager(db_path=str(src_path))
+    src_db.open_position({
+        "position_id": "POS_1",
+        "symbol": "BTC/USDT",
+        "entry_price": 50000.0,
+        "current_price": 50000.0,
+        "quantity": 0.05,
+        "cost_usd": 2500.0,
+        "status": "OPEN",
+    })
+    src_db.close()
+
+    # Pre-create dst DB
+    dst_db = DatabaseManager(db_path=str(dst_path))
+    dst_db.close()
+
+    # Run migration first time
+    res1 = migrate_legacy_db(src_path=str(src_path), dst_path=str(dst_path), backup_dir=str(backup_dir))
+    assert res1["migrated_positions"] == 1
+    assert len(list(backup_dir.glob("*.db"))) >= 1
+
+    # Run migration second time (idempotency check)
+    res2 = migrate_legacy_db(src_path=str(src_path), dst_path=str(dst_path), backup_dir=str(backup_dir))
+    assert res2["migrated_positions"] == 1
+
+    check_db = DatabaseManager(db_path=str(dst_path))
+    open_pos = check_db.get_open_positions()
+    check_db.close()
+    assert len(open_pos) == 1
+    assert open_pos[0]["position_id"] == "POS_1"
+
+
+def test_market_type_backfill(tmp_path) -> None:
+    """S4: Migration backfills market_type for futures positions and ensures non-null leverage/margin."""
+    from scripts.migrate_legacy_db import migrate_legacy_db
+
+    src_path = tmp_path / "legacy_mt.db"
+    dst_path = tmp_path / "live_mt.db"
+
+    src_db = DatabaseManager(db_path=str(src_path))
+    # Insert raw legacy position where market_type is NULL
+    src_db._conn.execute("""
+        INSERT INTO positions (
+            position_id, symbol, entry_client_order_id, entry_price, current_price,
+            invalidation_price, take_profit_price, quantity, cost_usd,
+            unrealized_pnl_usd, realized_pnl_usd, direction_confidence, setup_quality,
+            regime, status, opened_at_ms, market_type
+        ) VALUES (
+            'FUT_1', 'SOL/USDT', 'CID_1', 150.0, 150.0,
+            140.0, 165.0, 2.0, 300.0,
+            0.0, 0.0, 0.8, 0.8,
+            'momentum', 'OPEN', 1700000000000, NULL
+        )
+    """)
+    src_db.upsert_order({
+        "client_order_id": "SL_FUT_1",
+        "symbol": "SOL/USDT",
+        "side": "sell",
+        "order_type": "STOP_MARKET",
+        "status": "open",
+        "price": 140.0,
+        "amount": 2.0,
+        "filled": 0.0,
+        "cost_usd": 280.0,
+    })
+    src_db.close()
+
+    migrate_legacy_db(src_path=str(src_path), dst_path=str(dst_path))
+
+    dst_db = DatabaseManager(db_path=str(dst_path))
+    pos = dst_db.get_position("FUT_1")
+    dst_db.close()
+
+    assert pos is not None
+    assert pos["market_type"] == "futures"
+    assert pos["leverage"] is not None and pos["leverage"] >= 1
+    assert pos["margin_usd"] is not None
+    assert pos["notional_usd"] is not None
+
+
+@pytest.mark.asyncio
+async def test_time_stop_grace_for_legacy_positions(tmp_path) -> None:
+    """S4: Old positions within LEGACY_POSITION_GRACE_HOURS are protected from immediate time exit dump."""
+    cfg = Settings(
+        TRADING_MODE="live",
+        BINANCE_API_KEY="k",
+        BINANCE_API_SECRET="s",
+        DB_PATH=str(tmp_path / "grace.db"),
+        MAX_HOLD_BARS=32,  # 8 hours
+        LEGACY_POSITION_GRACE_HOURS=24.0,
+    )
+    db = DatabaseManager(db_path=cfg.DB_PATH)
+    try:
+        # Position opened 12 hours ago (> 8 hours max hold)
+        twelve_hours_ago_ms = int((time.time() - 12 * 3600) * 1000)
+        db.open_position({
+            "position_id": "OLD_POS_1",
+            "symbol": "BTC/USDT",
+            "entry_price": 50000.0,
+            "current_price": 50000.0,
+            "invalidation_price": 49000.0,
+            "take_profit_price": 52000.0,
+            "quantity": 0.01,
+            "cost_usd": 500.0,
+            "opened_at_ms": twelve_hours_ago_ms,
+            "market_type": "spot",
+            "status": "OPEN",
+            "sl_exchange_order_id": "sl_legacy_1",
+            "adopted": True,
+        })
+
+        class NoCloseExchange(StubCCXTClient):
+            def __init__(self):
+                super().__init__()
+                self.closed_orders = []
+
+            async def fetch_balance(self):
+                return {"free": {"BTC": 0.01, "USDT": 1000.0}, "total": {"BTC": 0.01, "USDT": 1000.0}}
+
+            async def fetch_tickers(self):
+                return {"BTC/USDT": {"last": 50000.0, "close": 50000.0}}
+
+            async def fetch_open_orders(self, symbol=None, params=None):
+                return [{
+                    "id": "sl_legacy_1",
+                    "symbol": "BTC/USDT",
+                    "type": "STOP_LOSS_LIMIT",
+                    "side": "sell",
+                    "amount": 0.01,
+                    "stopPrice": 49000.0,
+                    "status": "open",
+                }]
+
+            async def create_order(self, *args, **kwargs):
+                self.closed_orders.append(kwargs)
+                return {"id": "market_close_1"}
+
+        stub = NoCloseExchange()
+        ex = BinanceExchangeWrapper(db=db, custom_settings=cfg, ccxt_client=stub)
+        from engine.risk_engine import RiskEngine
+        from engine.execution import ExecutionEngine
+        risk = RiskEngine(db=db, custom_settings=cfg)
+        execution = ExecutionEngine(exchange=ex, db=db, risk_engine=risk, custom_settings=cfg)
+        reconciler = StateReconciler(db=db, exchange=ex, execution=execution, custom_settings=cfg)
+
+        await reconciler.reconcile_cycle()
+
+        # Invariant checks and time-exit must NOT close the position because it is within 24h grace
+        assert len(stub.closed_orders) == 0
+        pos = db.get_position("OLD_POS_1")
+        assert pos["status"] == "OPEN"
+    finally:
+        db.close()

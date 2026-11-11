@@ -646,8 +646,8 @@ class DatabaseManager:
                     pos.get("sl_exchange_order_id"),
                     float(pos["entry_price"]),
                     float(pos.get("current_price", pos["entry_price"])),
-                    float(pos["invalidation_price"]),
-                    float(pos["take_profit_price"]),
+                    float(pos.get("invalidation_price") or (float(pos["entry_price"]) * 0.98)),
+                    float(pos.get("take_profit_price") or (float(pos["entry_price"]) * 1.03)),
                     float(pos["quantity"]),
                     float(pos["cost_usd"]),
                     float(pos.get("direction_confidence", 0.80)),
@@ -823,6 +823,17 @@ class DatabaseManager:
             cursor = self._conn.execute(query)
             cols = [d[0] for d in cursor.description]
             return [dict(zip(cols, r)) for r in cursor.fetchall()]
+
+    def get_position(self, position_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM positions WHERE position_id = ?", [str(position_id)]
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cols = [d[0] for d in cursor.description]
+            return dict(zip(cols, row))
 
     def get_closed_positions_since(self, since_ms: int) -> List[Dict[str, Any]]:
         with self._lock:

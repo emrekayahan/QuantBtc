@@ -124,6 +124,30 @@ class AutonomousQuantEngineOrchestrator:
 
     async def initial_bootstrap(self) -> None:
         logger.info("Starting initial bootstrap of Autonomous Quantitative Trading Engine v3.0...")
+        # S4: Startup safety check for legacy unmigrated databases
+        from scripts.migrate_legacy_db import check_startup_safety
+        check_startup_safety(settings)
+
+        db_file = Path(settings.effective_db_path).name
+        open_pos_count = len(self.db.get_open_positions())
+        blocked = self.db.get_state("entries_blocked", "false") == "true"
+        autonomy_lvl = self.db.get_state("autonomy_level", "1")
+
+        logger.info(
+            "=== QUANTBOT STARTUP ===\n"
+            "  • MODE: %s\n"
+            "  • DB_PATH: %s\n"
+            "  • AUTONOMY_LEVEL: %s\n"
+            "  • ENTRIES_BLOCKED: %s\n"
+            "  • OPEN_POSITIONS_DB: %d\n"
+            "=========================",
+            settings.TRADING_MODE.upper(),
+            db_file,
+            autonomy_lvl,
+            blocked,
+            open_pos_count,
+        )
+
         try:
             drift_ms = await self.exchange.verify_clock_drift()
             logger.info("Initial NTP/Binance clock drift: %d ms", drift_ms)
@@ -326,13 +350,22 @@ class AutonomousQuantEngineOrchestrator:
         self.setup_schedules()
         self.scheduler.start()
         await self.telegram.start_polling()
+        db_file = Path(settings.effective_db_path).name
+        open_pos_count = len(self.db.get_open_positions())
+        blocked = self.db.get_state("entries_blocked", "false") == "true"
+        autonomy_lvl = self.db.get_state("autonomy_level", "1")
+
         await self.telegram.notify_system_event(
             "Sistem Başlatıldı",
             f"🤖 *QuantBot Live v3.0 Aktif*\n\n"
-            f"• Sunucu: `Canlı Üretim (Spot)`\n"
+            f"• Mod: `{settings.TRADING_MODE.upper()}`\n"
+            f"• Veritabanı: `{db_file}`\n"
+            f"• Otonomi Seviyesi: `{autonomy_lvl}`\n"
+            f"• Girişler Kilitli: `{'Evet' if blocked else 'Hayır'}`\n"
+            f"• Açık Pozisyonlar: `{open_pos_count}`\n"
             f"• Bakiye: `${float(self.db.get_state('total_equity_usd', '0.0') or 0.0):,.2f} USDT`\n"
             f"• Rejim: `{self.db.get_state('macro_regime', 'mean_reverting').upper()}`\n"
-            f"• Komutları görmek için: `/yardim`"
+            f"• Komutlar: `/yardim`"
         )
 
         # Run initial reflex evaluation pass immediately after bootstrap

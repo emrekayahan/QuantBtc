@@ -33,6 +33,7 @@ class StateReconciler:
         self.execution = execution
         self.cfg = custom_settings or settings
         self.telegram = telegram
+        self._startup_time_ms: int = int(time.time() * 1000)
         self.mistake_learner = mistake_learner or MistakeLearner(
             db=db, telegram=telegram
         )
@@ -794,15 +795,27 @@ class StateReconciler:
             max_hold_bars = int(getattr(self.cfg, "MAX_HOLD_BARS", 32))
             max_hold_ms = max_hold_bars * 15 * 60 * 1000
             opened_ms = int(pos.get("opened_at_ms", 0) or 0)
-            if opened_ms > 0 and (int(time.time() * 1000) - opened_ms) >= max_hold_ms and self.execution is not None:
-                try:
-                    await self.execution.close_single_position_market(
-                        position_id=pos_id, reason="MAX_HOLD_TIME_EXPIRED"
+            now_ms = int(time.time() * 1000)
+            grace_hours = float(getattr(self.cfg, "LEGACY_POSITION_GRACE_HOURS", 24.0))
+            grace_ms = grace_hours * 3600 * 1000
+            is_legacy = bool(pos.get("adopted") or (opened_ms > 0 and opened_ms < self._startup_time_ms))
+            time_since_startup = now_ms - self._startup_time_ms
+
+            if opened_ms > 0 and (now_ms - opened_ms) >= max_hold_ms and self.execution is not None:
+                if is_legacy and time_since_startup < grace_ms:
+                    logger.info(
+                        "Position %s is within legacy grace window (%.1fh remaining). Postponing time exit.",
+                        pos_id, max(0.0, (grace_ms - time_since_startup) / 3600000.0)
                     )
-                    reconciled_closed += 1
-                    continue
-                except Exception as exc:
-                    logger.error("Failed to close position %s at MAX_HOLD_TIME_EXPIRED: %s", pos_id, exc)
+                else:
+                    try:
+                        await self.execution.close_single_position_market(
+                            position_id=pos_id, reason="MAX_HOLD_TIME_EXPIRED"
+                        )
+                        reconciled_closed += 1
+                        continue
+                    except Exception as exc:
+                        logger.error("Failed to close position %s at MAX_HOLD_TIME_EXPIRED: %s", pos_id, exc)
 
             # Check if Take-Profit price reached
             if live_price >= tp_price and self.execution is not None:

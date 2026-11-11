@@ -74,6 +74,7 @@ class Settings(BaseSettings):
     ENTRY_ORDER_POLL_SEC: float = Field(default=2.0, ge=0.0, le=30.0)
     DUST_MAX_USD: float = Field(default=0.50, ge=0.0)
     RECONCILE_ORPHAN_CLOSE_MARKET: bool = Field(default=False)
+    LEGACY_POSITION_GRACE_HOURS: float = Field(default=24.0, ge=0.0)
     SL_LIMIT_BUFFER_PCT: float = Field(default=0.20, ge=0.0, le=5.0)
     SL_ESCALATION_SEC: float = Field(default=20.0, ge=1.0, le=300.0)
 
@@ -123,13 +124,10 @@ class Settings(BaseSettings):
     @property
     def effective_db_path(self) -> str:
         """Return dedicated DB path separated by trading mode."""
-        if self.DB_PATH.strip():
-            return self.DB_PATH
+        if self.DB_PATH and self.DB_PATH.strip():
+            return self.DB_PATH.strip()
         mode = str(self.TRADING_MODE).lower()
         if mode == "live":
-            legacy_live = BASE_DIR / "data" / "quant_bot.db"
-            if legacy_live.exists():
-                return str(legacy_live)
             return str(BASE_DIR / "data" / "quant_bot_live.db")
         return str(BASE_DIR / "data" / "quant_bot_paper.db")
 
