@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
+from engine.strategies import STRATEGY_SCORERS
 from tools.research.backtest import BacktestEngine, StrategySignal
 from tools.research.download import download_futures_history, generate_synthetic_ohlcv, load_cached_ohlcv
 from tools.research.gates import evaluate_g1_gate
@@ -75,14 +76,21 @@ def run_research(
     registry_db: Optional[str] = None,
 ) -> str:
     df_15m = load_cached_ohlcv(symbol, "15m", days)
+    df_1h = load_cached_ohlcv(symbol, "1h", days)
     if df_15m is None:
         if offline:
             df_15m = generate_synthetic_ohlcv(days=days, timeframe="15m", seed=seed)
         else:
             df_15m = asyncio.run(download_futures_history(symbol=symbol, timeframe="15m", days=days))
+    if df_1h is None:
+        if offline:
+            df_1h = generate_synthetic_ohlcv(days=days, timeframe="1h", seed=seed)
+        else:
+            df_1h = asyncio.run(download_futures_history(symbol=symbol, timeframe="1h", days=days))
 
+    score_fn = STRATEGY_SCORERS.get(strategy, baseline_legacy_score)
     bt = BacktestEngine()
-    res = bt.run(df_15m=df_15m, score_fn=baseline_legacy_score, symbol=symbol, seed=seed)
+    res = bt.run(df_15m=df_15m, df_1h=df_1h, score_fn=score_fn, symbol=symbol, seed=seed)
     boot = cluster_bootstrap_ci(res.trades, n_resamples=2000, seed=seed)
     reg = ExperimentRegistry(db_path=registry_db)
     try:

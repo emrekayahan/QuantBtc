@@ -11,22 +11,7 @@ import pandas as pd
 
 from config.settings import Settings, settings
 from engine.cost_model import CostModel
-
-
-@dataclass
-class StrategySignal:
-    strategy_id: str
-    side: str  # "long" | "short"
-    entry: float
-    stop: float
-    tp: float
-    entry_type: str = "MAKER"  # "MAKER" | "TAKER"
-    leverage: int = 3
-    max_hold_bars: int = 32
-    trail_atr_mult: float = 0.0
-    regime: str = "unknown"
-    signal_score: float = 0.0
-    features: Dict[str, Any] = field(default_factory=dict)
+from engine.strategies.base import StrategySignal, atr as compute_atr_series
 
 
 @dataclass
