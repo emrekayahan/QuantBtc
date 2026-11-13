@@ -22,6 +22,8 @@ class OpenRouterPool:
         http_client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         self.cfg = custom_settings or settings
+        self.gemini_key: str = str(getattr(self.cfg, "GEMINI_API_KEY", "") or "").strip()
+        self.gemini_model: str = str(getattr(self.cfg, "GEMINI_MODEL", "gemini-3.1-flash-lite") or "gemini-3.1-flash-lite").strip()
         self.keys: List[str] = list(self.cfg.openrouter_keys)
         self.models: List[str] = list(self.cfg.openrouter_model_list)
         self.timeout_seconds: float = float(self.cfg.OPENROUTER_TIMEOUT_SECONDS)
@@ -56,6 +58,11 @@ class OpenRouterPool:
 
     def get_telemetry(self) -> Dict[str, Any]:
         return {
+            "gemini": {
+                "configured": bool(self.gemini_key and not self.gemini_key.startswith("your_")),
+                "model": self.gemini_model,
+                "masked_key": f"...{self.gemini_key[-6:]}" if len(self.gemini_key) >= 6 else "",
+            },
             "configured_keys": len(self.keys),
             "active_key_index": self.get_current_key_index(),
             "models": self.models,
@@ -77,19 +84,50 @@ class OpenRouterPool:
             deterministic_fallback() if callable(deterministic_fallback) else str(deterministic_fallback)
         )
 
-        if not self.keys:
-            logger.warning("No valid OpenRouter keys configured; returning deterministic fallback.")
-            return {
-                "content": fallback_text,
-                "source": "deterministic_fallback",
-                "key_index": None,
-                "model": None,
-            }
-
         own_client = self._client is None
         client = self._client or httpx.AsyncClient(timeout=self.timeout_seconds)
 
         try:
+            # Priority Tier 1: Google AI Studio Gemini API (if configured)
+            if self.gemini_key and not self.gemini_key.startswith("your_"):
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent?key={self.gemini_key}"
+                    combined_prompt = f"{system_prompt}\n\n{prompt}"
+                    payload = {
+                        "contents": [{"parts": [{"text": combined_prompt}]}],
+                        "generationConfig": {
+                            "temperature": 0.1,
+                            "maxOutputTokens": max_tokens,
+                            "responseMimeType": "application/json",
+                        },
+                    }
+                    resp = await client.post(url, json=payload, timeout=min(self.timeout_seconds, 6.0))
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        candidates = data.get("candidates") or []
+                        if candidates:
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            if parts and parts[0].get("text"):
+                                txt = str(parts[0]["text"]).strip()
+                                return {
+                                    "content": txt,
+                                    "source": "gemini",
+                                    "key_index": "gemini",
+                                    "model": self.gemini_model,
+                                }
+                    logger.warning("Gemini API HTTP %d, falling back to OpenRouter pool.", resp.status_code)
+                except Exception as g_exc:
+                    logger.warning("Gemini API call failed (%s); falling back to OpenRouter pool.", g_exc)
+
+            if not self.keys:
+                logger.warning("No valid OpenRouter keys configured; returning deterministic fallback.")
+                return {
+                    "content": fallback_text,
+                    "source": "deterministic_fallback",
+                    "key_index": None,
+                    "model": None,
+                }
+
             for model in self.models:
                 for _ in range(len(self.keys)):
                     key_idx = self.get_current_key_index()

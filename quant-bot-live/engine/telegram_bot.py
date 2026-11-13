@@ -274,14 +274,30 @@ class TelegramNotifier:
             halted = state.get("system_halted", "false").lower() in ("true", "1")
             status_badge = "🔴 DURDURULDU (HALTED)" if halted else "🟢 AKTİF (ÇALIŞIYOR)"
 
+            # Breakdown of spot coins held in open positions
+            spot_coins_list = []
+            spot_positions_val = 0.0
+            for p in open_pos:
+                if str(p.get("market_type", "spot")).lower() == "spot":
+                    val = float(p.get("notional_usd") or p.get("cost_usd") or 0.0)
+                    sym = p.get("symbol", "").split("/")[0]
+                    spot_positions_val += val
+                    spot_coins_list.append(f"{sym}: ~${val:.2f}")
+
+            spot_coins_detail = f" ({', '.join(spot_coins_list)})" if spot_coins_list else ""
+
             msg = (
                 f"📊 *SİSTEM DURUM RAPORU*\n\n"
                 f"• *Durum:* {status_badge}\n"
-                f"• *Aktif İşlem Modu:* `{mode_badge}`\n"
-                f"• *Toplam Bakiye:* `${eq:,.2f}`\n"
-                f"• *Spot USDT (Boşta):* `${spot_free:,.2f}`\n"
-                f"• *Futures USDT:* `${fut_total:,.2f} Toplam (${fut_free:,.2f} Boşta / ${fut_used:,.2f} İşlemde)`\n"
-                f"• *Açık Pozisyonlar:* `{len(open_pos)} Adet`\n"
+                f"• *Aktif Mod:* `{mode_badge}`\n\n"
+                f"💰 *CÜZDAN & BAKİYE KIRILIMI:*\n"
+                f"  💵 *Spot Boşta (Nakit):* `${spot_free:,.2f} USDT`\n"
+                f"  🪙 *Spot Açık Coin:* `${spot_positions_val:,.2f}`{spot_coins_detail}\n"
+                f"  ⚡ *Vadeli (Futures):* `${fut_total:,.2f} USDT` `(${fut_free:,.2f} Boşta / ${fut_used:,.2f} Pozisyonda)`\n"
+                f"  ━━━━━━━━━━━━━━━━━━━━\n"
+                f"  📊 *Toplam Kasa (Net Equity):* `${eq:,.2f}`\n\n"
+                f"📈 *İŞLEM & PERFORMANS:*\n"
+                f"• *Açık Pozisyon:* `{len(open_pos)} Adet`\n"
                 f"• *Günlük İşlem Kotası:* `{daily_trades} / {max_daily_trades}`\n"
                 f"• *Min Güven Eşiği:* `%{min_conf * 100:.0f}`\n"
                 f"• *Günlük K/Z:* `${pnl:+,.2f}`\n"

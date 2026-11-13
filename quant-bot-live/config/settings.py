@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     BINANCE_API_KEY: str = Field(default="your_binance_spot_api_key_here")
     BINANCE_API_SECRET: str = Field(default="your_binance_spot_api_secret_here")
 
+    # Google AI Studio / Gemini API configuration
+    GEMINI_API_KEY: str = Field(default="")
+    GEMINI_MODEL: str = Field(default="gemini-3.1-flash-lite")
+
     # OpenRouter free-tier API keys (1 to 3 keys)
     OPENROUTER_API_KEY_1: str = Field(default="")
     OPENROUTER_API_KEY_2: str = Field(default="")

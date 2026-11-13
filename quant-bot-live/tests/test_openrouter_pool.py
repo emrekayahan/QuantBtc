@@ -13,6 +13,7 @@ from engine.openrouter_pool import OpenRouterPool
 
 def make_test_settings() -> Settings:
     return Settings(
+        GEMINI_API_KEY="",
         OPENROUTER_API_KEY_1="sk-or-v1-test_key_alpha_111111",
         OPENROUTER_API_KEY_2="sk-or-v1-test_key_beta_222222",
         OPENROUTER_API_KEY_3="sk-or-v1-test_key_gamma_333333",
@@ -119,3 +120,33 @@ def test_duckdb_manager_crud_operations(tmp_path) -> None:
         assert wl[0]["symbol"] == "BTC/USDT"
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_gemini_primary_success() -> None:
+    """Verify Gemini API is called first when configured."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "generativelanguage.googleapis.com" in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "candidates": [
+                        {"content": {"parts": [{"text": '{"confidence": 0.85, "reason": "Gemini primary"}'}]}}
+                    ]
+                },
+            )
+        return httpx.Response(500, json={"error": "should not be reached"})
+
+    cfg = Settings(
+        GEMINI_API_KEY="test_gemini_key",
+        GEMINI_MODEL="gemini-3.1-flash-lite",
+        OPENROUTER_API_KEY_1="sk-or-test",
+    )
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        pool = OpenRouterPool(custom_settings=cfg, http_client=client)
+        res = await pool.complete_with_fallback("test prompt", "fallback")
+        assert res["source"] == "gemini"
+        assert res["model"] == "gemini-3.1-flash-lite"
+        assert "Gemini primary" in res["content"]
+
