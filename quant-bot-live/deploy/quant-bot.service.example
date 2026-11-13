@@ -1,0 +1,19 @@
+[Unit]
+Description=QuantBot Live V4 Autonomous Futures Engine
+After=network-online.target chrony.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/quant-bot-live
+ExecStart=/root/quant-bot-live/.venv/bin/python /root/quant-bot-live/main.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+MemoryHigh=1200M
+MemoryMax=1500M
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
