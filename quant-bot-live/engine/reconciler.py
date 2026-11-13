@@ -135,11 +135,13 @@ class StateReconciler:
             val_usd = amt * px
             if sym not in db_pos_by_sym:
                 if val_usd <= dust_max:
-                    # Dust position: ignore and do not block entries
+                    # Dust position: ignore and do not block entries; log INFO only on first seen / value increase
                     v = {"invariant": "I1", "type": "orphan_spot_dust", "symbol": sym, "amount": amt, "val_usd": val_usd}
-                    self.db.add_reconcile_event("I1_ORPHAN_DUST_IGNORED", sym, v, resolved=True)
+                    should_log = self.db.upsert_dust_ignored(sym, val_usd)
+                    if should_log:
+                        self.db.add_reconcile_event("I1_ORPHAN_DUST_IGNORED", sym, v, resolved=True)
+                        logger.info("Orphan spot for %s is dust ($%.2f <= $%.2f), ignoring.", sym, val_usd, dust_max)
                     resolved.append(v)
-                    logger.info("Orphan spot for %s is dust ($%.2f <= $%.2f), ignoring.", sym, val_usd, dust_max)
                     continue
 
                 v = {"invariant": "I1", "type": "orphan_spot", "symbol": sym, "amount": amt, "val_usd": val_usd}
@@ -421,11 +423,51 @@ class StateReconciler:
                 v = {"invariant": "I2", "symbol": sym, "position_id": pos_id, "db_qty": db_qty, "exch_qty": exch_qty}
                 violations.append(v)
                 self.db.add_reconcile_event("I2_PHANTOM_POSITION", sym, v, resolved=False)
+
+                # K0-6: Lookup real fill price before falling back to ticker estimate
+                real_exit_price = px
+                close_reason = "PHANTOM_POSITION_RESOLVED_CLOSED"
+                pnl_estimated = True
+                sl_oid = pos.get("sl_exchange_order_id")
+                if sl_oid:
+                    try:
+                        sl_info = (
+                            await self.exchange.fetch_futures_order(str(sl_oid), sym)
+                            if m_type == "futures" and hasattr(self.exchange, "fetch_futures_order")
+                            else await self.exchange.fetch_order(str(sl_oid), sym)
+                        )
+                        if sl_info and str(sl_info.get("status") or "").lower() in ("closed", "filled"):
+                            fill_p = float(sl_info.get("average") or sl_info.get("price") or sl_info.get("stopPrice") or 0.0)
+                            if fill_p > 0:
+                                real_exit_price = fill_p
+                                close_reason = "SERVER_SIDE_STOP_LOSS_FILLED"
+                                pnl_estimated = False
+                    except Exception:
+                        pass
+
+                if pnl_estimated and hasattr(self.exchange, "fetch_my_trades"):
+                    try:
+                        opened_ms = int(pos.get("opened_at_ms") or 0)
+                        trades = await self.exchange.fetch_my_trades(sym, limit=10)
+                        matching = [
+                            t for t in (trades or [])
+                            if int(t.get("timestamp") or 0) >= opened_ms and str(t.get("side") or "").lower() == "sell"
+                        ]
+                        if matching:
+                            last_fill = matching[-1]
+                            fill_p = float(last_fill.get("price") or 0.0)
+                            if fill_p > 0:
+                                real_exit_price = fill_p
+                                pnl_estimated = False
+                    except Exception:
+                        pass
+
                 # Auto-remediate I2: mark closed in DB
                 self.db.close_position(
                     position_id=pos_id,
-                    exit_price=px,
-                    close_reason="PHANTOM_POSITION_RESOLVED_CLOSED",
+                    exit_price=real_exit_price,
+                    close_reason=close_reason,
+                    pnl_estimated=pnl_estimated,
                 )
                 self.db.add_reconcile_event("I2_PHANTOM_RESOLVED", sym, v, resolved=True)
                 resolved.append(v)

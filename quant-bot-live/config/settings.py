@@ -61,6 +61,8 @@ class Settings(BaseSettings):
     MAX_DRAWDOWN_PCT: float = Field(default=15.0, gt=0.0, le=100.0)
     MIN_24H_VOLUME_USD: float = Field(default=10_000_000.0, gt=0.0)
     MAX_SPREAD_PCT: float = Field(default=0.20, gt=0.0, le=5.0)
+    SYMBOL_BLACKLIST: str = Field(default="U,USDC,FDUSD,TUSD,USDP,DAI,BUSD,EUR,GBP,TRY,XAUT,PAXG,RWUSD")
+    MAX_ABS_24H_CHANGE_PCT: float = Field(default=35.0, gt=1.0, le=500.0)
     MIN_CONFIDENCE_THRESHOLD: float = Field(default=0.68, ge=0.50, le=0.99)
     MIN_SETUP_QUALITY: int = Field(default=2, ge=1, le=3)
     ROUND_TRIP_FEE_PCT: float = Field(default=0.20, ge=0.0, le=2.0)

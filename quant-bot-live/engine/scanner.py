@@ -166,6 +166,39 @@ class AutonomousMarketScanner:
             return False
         return True
 
+    def is_symbol_excluded(self, symbol: str, change_24h_pct: Optional[float] = None) -> bool:
+        """K0-5: Check dynamic blacklist, stable/peg assets, and extreme 24h change."""
+        if not self.is_eligible_usdt_spot_symbol(symbol):
+            return True
+        base = symbol.split("/")[0].upper()
+        blacklist = {
+            tok.strip().upper()
+            for tok in str(getattr(self.cfg, "SYMBOL_BLACKLIST", "")).split(",")
+            if tok.strip()
+        }
+        if base in blacklist:
+            return True
+        max_chg = float(getattr(self.cfg, "MAX_ABS_24H_CHANGE_PCT", 35.0))
+        if change_24h_pct is not None and abs(float(change_24h_pct)) > max_chg:
+            return True
+        return False
+
+    @staticmethod
+    def is_peg_candles(ohlcv: List[List[Any]], min_bars: int = 20, max_range_ratio: float = 0.002) -> bool:
+        """K0-5: Detect flat/peg tokens where 100-bar (or >=min_bars) price range < 0.2%."""
+        if not ohlcv or len(ohlcv) < min_bars:
+            return False
+        window = ohlcv[-100:]
+        highs = [float(c[2]) for c in window if len(c) >= 5 and float(c[2]) > 0]
+        lows = [float(c[3]) for c in window if len(c) >= 5 and float(c[3]) > 0]
+        if not highs or not lows:
+            return False
+        max_h = max(highs)
+        min_l = min(lows)
+        if min_l <= 0:
+            return True
+        return ((max_h - min_l) / min_l) < max_range_ratio
+
     @staticmethod
     def classify_regime_from_closed_candles(df_closed: pd.DataFrame) -> Dict[str, Any]:
         """Deterministically classify regime from strictly closed BTC/ETH candles."""
@@ -302,6 +335,8 @@ class AutonomousMarketScanner:
 
             spread_bps = spread_pct * 100.0
             change_24h_pct = float(t.get("percentage") or 0.0)
+            if self.is_symbol_excluded(symbol, change_24h_pct=change_24h_pct):
+                continue
             # Volume momentum score favors high liquidity with positive momentum
             momentum_multiplier = 1.0 + max(-0.5, min(0.5, change_24h_pct / 100.0))
             score = quote_vol * momentum_multiplier

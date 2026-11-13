@@ -175,6 +175,19 @@ class ExecutionEngine:
         position_usd = float(routed["position_usd"])
         leverage = int(routed.get("leverage", 1))
 
+        # K0-4: Pre-check exchange min_notional (with 10% safety buffer) and min_amount before order
+        market_limits = self.exchange.get_market_limits(decision.symbol, market_type=trading_mode)
+        min_notional_limit = float(market_limits.get("min_notional", 10.0))
+        min_amount_limit = float(market_limits.get("min_amount", 0.0))
+        est_qty = position_usd / float(decision.entry_price) if float(decision.entry_price) > 0 else 0.0
+        if position_usd < min_notional_limit * 1.1 or (min_amount_limit > 0.0 and est_qty < min_amount_limit):
+            reason = (
+                f"min_notional pre-check failed ({trading_mode}): "
+                f"pos=${position_usd:.2f} < 1.1*${min_notional_limit:.2f} or qty={est_qty:.6f} < {min_amount_limit:.6f}"
+            )
+            logger.warning("Order rejected for %s: %s", decision.symbol, reason)
+            return {"executed": False, "reject_reason": "min_notional", "reason": reason}
+
         gate = self.risk_engine.evaluate_gate(
             decision=decision,
             free_usdt=free_usdt,

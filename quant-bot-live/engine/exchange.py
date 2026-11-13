@@ -170,7 +170,11 @@ class BinanceExchangeWrapper:
             if self.db is not None:
                 self.db.set_state("entries_blocked", "true")
         elif abs(drift_ms) >= warn_ms:
-            logger.warning("Clock drift %dms exceeds CLOCK_WARN_MS (%dms).", drift_ms, warn_ms)
+            now_s = time.time()
+            last_warn_s = float(getattr(self, "_last_clock_warn_ts", 0.0))
+            if (now_s - last_warn_s) >= 1800.0:
+                logger.warning("Clock drift %dms exceeds CLOCK_WARN_MS (%dms).", drift_ms, warn_ms)
+                self._last_clock_warn_ts = now_s
 
         if abs(drift_ms) > 1000:
             logger.warning("Clock drift exceeds 1000ms (%dms). Adjusting time difference.", drift_ms)
@@ -223,6 +227,55 @@ class BinanceExchangeWrapper:
         except Exception:
             pass
         return default_min_usd
+
+    @staticmethod
+    def floor_to_step(value: float, step: float) -> float:
+        """Floor a quantity or price to the exchange's step/tick size."""
+        if step <= 0 or value <= 0:
+            return max(0.0, float(value))
+        from decimal import Decimal, ROUND_DOWN
+        d_val = Decimal(str(value))
+        d_step = Decimal(str(step))
+        floored = (d_val / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step
+        return float(floored)
+
+    def get_market_limits(self, symbol: str, market_type: str = "SPOT") -> Dict[str, float]:
+        """Return min_notional, min_amount, amount_step, price_tick for SPOT or FUTURES."""
+        is_futures = str(market_type).upper() == "FUTURES"
+        default_notional = 5.0 if is_futures else 10.0
+        result = {
+            "min_notional": default_notional,
+            "min_amount": 0.0,
+            "amount_step": 0.0,
+            "price_tick": 0.0,
+        }
+        try:
+            client = self.futures_client if (is_futures and self.futures_client is not None) else self.client
+            markets = (getattr(client, "markets", None) or {})
+            market = markets.get(symbol)
+            if market is None and is_futures:
+                market = markets.get(f"{symbol}:USDT")
+            if not market:
+                return result
+            limits = market.get("limits", {})
+            min_cost = limits.get("cost", {}).get("min")
+            if min_cost is not None and float(min_cost) > 0.0:
+                result["min_notional"] = float(min_cost)
+            min_amt = limits.get("amount", {}).get("min")
+            if min_amt is not None and float(min_amt) > 0.0:
+                result["min_amount"] = float(min_amt)
+            prec = market.get("precision", {})
+            amt_prec = prec.get("amount")
+            if amt_prec is not None:
+                val = float(amt_prec)
+                result["amount_step"] = val if val < 1.0 else (10.0 ** (-int(val)) if val >= 0 else 0.0)
+            px_prec = prec.get("price")
+            if px_prec is not None:
+                val = float(px_prec)
+                result["price_tick"] = val if val < 1.0 else (10.0 ** (-int(val)) if val >= 0 else 0.0)
+        except Exception:
+            pass
+        return result
 
     async def fetch_tickers(self) -> Dict[str, Any]:
         await self.ensure_markets_loaded()

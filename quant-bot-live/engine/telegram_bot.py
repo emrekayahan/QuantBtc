@@ -236,8 +236,32 @@ class TelegramNotifier:
                 "• `/pozisyonlar` veya `/pos` — Açık işlem ve emirler\n"
                 "• `/dersler` veya `/lessons` — Öğrenilen hatalar ve aktif kurallar\n"
                 "• `/audit` veya `/brier` — Son 24 saatlik Brier kalibrasyonu\n"
+                "• `/saglik` — Sistem sağlığı, clock drift ve hata sayaçları\n"
                 "• `/panic` veya `/stop` — 🚨 Acil Durum: Her şeyi kapat ve sistemi kilitle\n"
                 "• `/baslat` veya `/resume` — Durdurulmuş sistemi tekrar aktif et"
+            )
+            await self.send_message(msg)
+
+        elif cmd in ("/saglik", "/sağlık", "/health"):
+            if not self.db:
+                await self.send_message("❌ Veritabanı bağlantısı henüz hazır değil.")
+                return
+            state = self.db.get_all_system_state()
+            safe_mode = self.db.is_safe_mode()
+            entries_blocked = state.get("entries_blocked", "false")
+            drift_ms = state.get("clock_drift_ms", "?")
+            resolver_errs = state.get("resolver_errors", "0")
+            hb_ts = float(state.get("last_heartbeat_ts", "0") or 0)
+            hb_age = f"{int(time.time() - hb_ts)}s" if hb_ts > 0 else "N/A"
+            open_pos = len(self.db.get_open_positions(include_unprotected=True))
+            msg = (
+                "🩺 *Sistem Sağlığı (/saglik)*\n"
+                f"• Safe Mode: `{'ON' if safe_mode else 'OFF'}`\n"
+                f"• Entries Blocked: `{entries_blocked}`\n"
+                f"• Clock Drift: `{drift_ms} ms`\n"
+                f"• Heartbeat Yaşı: `{hb_age}`\n"
+                f"• Resolver Hataları: `{resolver_errs}`\n"
+                f"• Açık Pozisyon: `{open_pos}`"
             )
             await self.send_message(msg)
 

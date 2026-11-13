@@ -1,0 +1,10 @@
+/root/quant-bot-live/quant_bot.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    maxsize 20M
+}

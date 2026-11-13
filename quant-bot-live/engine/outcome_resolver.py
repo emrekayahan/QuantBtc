@@ -42,11 +42,12 @@ class OutcomeResolver:
         fee_pct: float = 0.10,
         slippage_pct: float = 0.05,
         horizon_bars: int = 32,
+        require_entry_touch: bool = False,
     ) -> Dict[str, Any]:
         """
         Pure deterministic resolution of a signal against OHLCV candles.
         candles: list of dicts with keys 'open', 'high', 'low', 'close', 'timestamp'.
-        Returns dict with result (TP/SL/TIMEOUT), r_gross, r_net, bars_to_exit, mae_r, mfe_r.
+        Returns dict with result (TP/SL/TIMEOUT/NOT_FILLED), r_gross, r_net, bars_to_exit, mae_r, mfe_r.
         """
         is_long = side.lower() == "long"
         risk_dist = abs(entry - sl)
@@ -58,11 +59,18 @@ class OutcomeResolver:
         mae_dist = 0.0
         mfe_dist = 0.0
         bars_count = 0
+        entry_filled = not require_entry_touch
 
         for i, c in enumerate(candles[:horizon_bars]):
             bars_count = i + 1
             high = float(c["high"])
             low = float(c["low"])
+
+            if not entry_filled:
+                if low <= entry <= high:
+                    entry_filled = True
+                else:
+                    continue
 
             if is_long:
                 curr_mae = max(0.0, entry - low)
@@ -157,6 +165,16 @@ class OutcomeResolver:
                         "mfe_r": round(mfe_dist / risk_dist, 4),
                     }
 
+        if not entry_filled:
+            return {
+                "result": "NOT_FILLED",
+                "r_gross": 0.0,
+                "r_net": 0.0,
+                "bars_to_exit": bars_count,
+                "mae_r": 0.0,
+                "mfe_r": 0.0,
+            }
+
         # If horizon reached without TP or SL
         last_close = float(candles[min(len(candles) - 1, horizon_bars - 1)]["close"]) if candles else entry
         if is_long:
@@ -234,6 +252,7 @@ class OutcomeResolver:
                     fee_pct=fee_pct,
                     slippage_pct=slippage_pct,
                     horizon_bars=horizon,
+                    require_entry_touch=True,
                 )
 
                 # Save outcome

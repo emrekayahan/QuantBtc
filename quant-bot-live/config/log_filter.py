@@ -12,7 +12,8 @@ class SensitiveDataFilter(logging.Filter):
 
     PATTERNS = [
         re.compile(r"sk-or-v1-[a-zA-Z0-9_-]{10,}", re.IGNORECASE),
-        re.compile(r"\b\d{8,12}:[a-zA-Z0-9_-]{30,}\b"),  # Telegram tokens
+        re.compile(r"(?:bot)?\d{8,12}:[A-Za-z0-9_-]{30,}"),  # Telegram tokens (including inside URLs)
+        re.compile(r"(?:key=|AIza|AQ\.)[A-Za-z0-9_.-]{15,}"),  # Gemini / Google API keys in URLs or text
         re.compile(r"(api[_-]?secret|password|secret|api[_-]?key)\s*[:=]\s*['\"]?([^'\"\s,%]+)['\"]?", re.IGNORECASE),
     ]
 
@@ -25,7 +26,8 @@ class SensitiveDataFilter(logging.Filter):
             text = text.replace(s, "[MASKED_SECRET]")
         text = self.PATTERNS[0].sub("[MASKED_SECRET]", text)
         text = self.PATTERNS[1].sub("[MASKED_SECRET]", text)
-        text = self.PATTERNS[2].sub(r"\1=[MASKED_SECRET]", text)
+        text = self.PATTERNS[2].sub("[MASKED_SECRET]", text)
+        text = self.PATTERNS[3].sub(r"\1=[MASKED_SECRET]", text)
         return text
 
     def _mask_arg(self, a: Any) -> Any:

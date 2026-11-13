@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import signal
 import sys
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
 
 import uvicorn
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -43,6 +45,7 @@ def configure_logging() -> None:
         settings.BINANCE_API_SECRET,
         settings.TELEGRAM_BOT_TOKEN,
         settings.DASHBOARD_PASSWORD,
+        getattr(settings, "GEMINI_API_KEY", ""),
     }
     for k in settings.openrouter_keys:
         sensitive_keys.add(k)
@@ -50,7 +53,12 @@ def configure_logging() -> None:
     filt = SensitiveDataFilter(sensitive_keys)
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.addFilter(filt)
-    file_handler = logging.FileHandler(log_dir / "quant_bot.log", encoding="utf-8")
+    file_handler = RotatingFileHandler(
+        log_dir / "quant_bot.log",
+        maxBytes=20 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
     file_handler.addFilter(filt)
 
     logging.basicConfig(
@@ -58,6 +66,8 @@ def configure_logging() -> None:
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         handlers=[stdout_handler, file_handler],
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 
 logger = logging.getLogger("quant_bot.main")
@@ -120,8 +130,45 @@ class AutonomousQuantEngineOrchestrator:
             db=self.db,
         )
         self.scheduler = AsyncIOScheduler(timezone="UTC")
+        self._job_error_counts: Dict[str, int] = {}
+        self.scheduler.add_listener(self._on_scheduler_job_error, EVENT_JOB_ERROR)
+        self.scheduler.add_listener(self._on_scheduler_job_executed, EVENT_JOB_EXECUTED)
         self._last_evaluated_candle_ts: Dict[str, int] = {}
         self._stop_event = asyncio.Event()
+
+    def _on_scheduler_job_executed(self, event: Any) -> None:
+        job_id = getattr(event, "job_id", None)
+        if job_id:
+            self._job_error_counts[job_id] = 0
+
+    def _on_scheduler_job_error(self, event: Any) -> None:
+        job_id = str(getattr(event, "job_id", "unknown"))
+        count = self._job_error_counts.get(job_id, 0) + 1
+        self._job_error_counts[job_id] = count
+        exc = getattr(event, "exception", None)
+        if count == 1:
+            tb = getattr(event, "traceback", "")
+            logger.error("APScheduler job '%s' failed (#1): %s\n%s", job_id, exc, tb)
+        else:
+            logger.error("APScheduler job '%s' failed consecutively (%d times): %s", job_id, count, exc)
+
+        if count >= 3 and not self.db.is_safe_mode():
+            reason = f"Job '{job_id}' failed {count} consecutive times: {exc}"
+            logger.critical("Activating SAFE_MODE due to repeated job errors: %s", reason)
+            self.db.set_safe_mode(True, reason=reason)
+            self.db.set_state("entries_blocked", "true")
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(
+                    self.telegram.send_message(
+                        f"🚨 *SİSTEM ALARM: SAFE MODE AKTİF*\n\n"
+                        f"• *Hatalı İş:* `{job_id}`\n"
+                        f"• *Ardışık Hata:* `{count}`\n"
+                        f"• *Detay:* `{str(exc)[:180]}`"
+                    )
+                )
+            except RuntimeError:
+                pass
 
     async def initial_bootstrap(self) -> None:
         logger.info("Starting initial bootstrap of Autonomous Quantitative Trading Engine v3.0...")
@@ -300,16 +347,19 @@ class AutonomousQuantEngineOrchestrator:
     async def safe_overnight_brier_job(self) -> None:
         try:
             res = await self.overnight_reviewer.run_overnight_review()
+            bs = float(res.get("brier_score") or 0.0)
+            sc = int(res.get("sample_count") or 0)
+            mct = float(res.get("min_confidence_threshold") or 0.8)
             logger.info(
                 "00:05 UTC Overnight Brier Review complete: BS=%.4f (n=%d)",
-                res["brier_score"],
-                res["sample_count"],
+                bs,
+                sc,
             )
             await self.telegram.send_message(
                 f"🌙 *00:05 UTC Gece Denetim Raporu*\n\n"
-                f"• Brier Skoru: `{res.get('brier_score', 0):.4f}`\n"
-                f"• 24s İşlem Sayısı: `{res.get('sample_count', 0)}`\n"
-                f"• Min Güven Eşiği: `%{res.get('min_confidence_threshold', 0.8)*100:.0f}`"
+                f"• Brier Skoru: `{bs:.4f}`\n"
+                f"• 24s İşlem Sayısı: `{sc}`\n"
+                f"• Min Güven Eşiği: `%{mct*100:.0f}`"
             )
         except Exception as exc:
             logger.error("00:05 UTC Overnight Brier Review error: %s", exc)

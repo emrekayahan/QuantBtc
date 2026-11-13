@@ -201,6 +201,16 @@ class DatabaseManager:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS dust_ignored (
+                    symbol VARCHAR PRIMARY KEY,
+                    value_usd DOUBLE NOT NULL,
+                    first_seen_ms BIGINT NOT NULL,
+                    last_seen_ms BIGINT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS signal_outcomes (
                     decision_id VARCHAR PRIMARY KEY,
                     symbol VARCHAR NOT NULL,
@@ -1191,6 +1201,33 @@ class DatabaseManager:
     def update_heartbeat(self) -> None:
         now_ms = int(time.time() * 1000)
         self.set_state("last_heartbeat_ms", str(now_ms))
+
+    def upsert_dust_ignored(self, symbol: str, value_usd: float) -> bool:
+        """Record ignored dust balance; return True only on first sighting or meaningful value increase."""
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value_usd FROM dust_ignored WHERE symbol = ?",
+                [symbol],
+            ).fetchone()
+            if row is None:
+                self._conn.execute(
+                    """
+                    INSERT INTO dust_ignored (symbol, value_usd, first_seen_ms, last_seen_ms)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [symbol, float(value_usd), now_ms, now_ms],
+                )
+                return True
+            prev_val = float(row[0] or 0.0)
+            increased = float(value_usd) > max(prev_val * 1.15, prev_val + 0.05)
+            self._conn.execute(
+                """
+                UPDATE dust_ignored SET value_usd = ?, last_seen_ms = ? WHERE symbol = ?
+                """,
+                [float(value_usd), now_ms, symbol],
+            )
+            return increased
 
     def close(self) -> None:
         with self._lock:
