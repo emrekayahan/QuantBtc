@@ -188,6 +188,64 @@ class DatabaseManager:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS suspended_patterns (
+                    pattern_key VARCHAR PRIMARY KEY,
+                    n_trades INTEGER NOT NULL,
+                    lcb_80 DOUBLE NOT NULL,
+                    suspended_until_ms BIGINT NOT NULL,
+                    updated_at_ms BIGINT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strategy_lifecycle (
+                    strategy_id VARCHAR PRIMARY KEY,
+                    state VARCHAR NOT NULL,
+                    g1_passed BOOLEAN DEFAULT FALSE,
+                    updated_at_ms BIGINT NOT NULL,
+                    reason VARCHAR
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS learning_budget_events (
+                    event_id VARCHAR PRIMARY KEY,
+                    pnl_usd DOUBLE NOT NULL,
+                    source VARCHAR NOT NULL,
+                    ts_ms BIGINT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS state_log (
+                    id VARCHAR PRIMARY KEY,
+                    old_state VARCHAR NOT NULL,
+                    new_state VARCHAR NOT NULL,
+                    reason VARCHAR NOT NULL,
+                    ts_ms BIGINT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS decision_log (
+                    decision_id VARCHAR PRIMARY KEY,
+                    strategy_id VARCHAR NOT NULL,
+                    symbol VARCHAR NOT NULL,
+                    side VARCHAR NOT NULL,
+                    risk_pct DOUBLE NOT NULL,
+                    leverage INTEGER NOT NULL,
+                    stop_dist_pct DOUBLE NOT NULL,
+                    reason VARCHAR NOT NULL,
+                    ts_ms BIGINT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS paper_ledger (
                     id VARCHAR PRIMARY KEY,
                     ts_ms BIGINT NOT NULL,

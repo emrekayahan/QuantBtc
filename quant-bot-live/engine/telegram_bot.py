@@ -267,6 +267,30 @@ class TelegramNotifier:
             )
             await self.send_message(msg)
 
+        elif cmd == "/onayla_ogrenme":
+            if not self.db:
+                await self.send_message("❌ Veritabanı bağlantısı henüz hazır değil.")
+                return
+            from engine.learning_budget import LearningBudgetManager
+            eq = float(self.db.get_state("total_equity_usd", "0.0") or 0.0)
+            LearningBudgetManager(db=self.db, custom_settings=self.cfg).approve_budget_renewal(eq)
+            await self.send_message(f"✅ 14 günlük canlı öğrenme bütçesi yenilendi (referans bakiye: `${eq:.2f}`).")
+
+        elif cmd == "/ogrendim":
+            if not self.db:
+                await self.send_message("❌ Veritabanı bağlantısı henüz hazır değil.")
+                return
+            rows = self.db._conn.execute(
+                "SELECT strategy_id, state, g1_passed FROM strategy_lifecycle ORDER BY strategy_id"
+            ).fetchall()
+            susp = self.db._conn.execute("SELECT count(*) FROM suspended_patterns").fetchone()
+            susp_cnt = int(susp[0] or 0) if susp else 0
+            lines = ["🧠 *Öğrenme Özeti (/ogrendim)*"]
+            for r in rows:
+                lines.append(f"• `{r[0]}`: `{r[1]}` (G1=`{r[2]}`)")
+            lines.append(f"• Askıya alınan desen sayısı: `{susp_cnt}`")
+            await self.send_message("\n".join(lines))
+
         elif cmd in ("/durum", "/status", "/ozet", "/özet"):
             if not self.db:
                 await self.send_message("❌ Veritabanı bağlantısı henüz hazır değil.")

@@ -82,6 +82,12 @@ class Settings(BaseSettings):
     SYMBOL_SL_COOLDOWN_HOURS: float = Field(default=4.0, ge=0.0, le=72.0)
     G1_MIN_TRADES: int = Field(default=150, ge=10)
     G1_LCB_MIN_R: float = Field(default=-0.05)
+    G2_MIN_LIVE_TRADES: int = Field(default=60, ge=10)
+    G2_P_MU_POS: float = Field(default=0.80, gt=0.0, le=1.0)
+    G3_MIN_LIVE_TRADES: int = Field(default=150, ge=10)
+    G3_P_MU_POS: float = Field(default=0.95, gt=0.0, le=1.0)
+    LEARNING_BUDGET_PCT: float = Field(default=15.0, gt=0.0, le=50.0)
+    MAX_LEARN_TRADES_PER_DAY: int = Field(default=4, ge=1, le=50)
     RESEARCH_MAX_CONFIGS_PER_STRATEGY: int = Field(default=12, ge=1, le=50)
     RESEARCH_DATA_DIR: str = Field(default="research_data")
 
