@@ -1082,8 +1082,10 @@ async def test_r15_short_not_allowed_on_spot(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_r17_autonomy_level_and_safe_mode(tmp_path) -> None:
+async def test_r17_autonomy_level_and_safe_mode(tmp_path, monkeypatch) -> None:
     """R17 test: Verify autonomy ladder persistence and safe mode entry gate blocking."""
+    import sys
+    monkeypatch.setattr(sys.modules["config.settings"].settings, "AUTONOMY_START_LEVEL", 0)
     cfg = Settings(
         TRADING_MODE="live",
         AUTONOMY_START_LEVEL=0,
