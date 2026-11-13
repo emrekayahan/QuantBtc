@@ -31,7 +31,9 @@ unprotected = [p for p in open_positions if p.get("status") == "OPEN_UNPROTECTED
 if unprotected:
     print(f"CRITICAL: Found {len(unprotected)} unprotected position(s)! Aborting deploy to prevent risk.")
     for p in unprotected:
-        print(f" - Symbol: {p.get(\"symbol\")} | ID: {p.get(\"position_id\")}")
+        sym = p.get("symbol")
+        pid = p.get("position_id")
+        print(f" - Symbol: {sym} | ID: {pid}")
     exit(1)
 print(f"Position safety check passed ({len(open_positions)} protected open positions).")
 '
