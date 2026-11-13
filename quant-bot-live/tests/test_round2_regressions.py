@@ -1086,6 +1086,7 @@ async def test_r17_autonomy_level_and_safe_mode(tmp_path) -> None:
     """R17 test: Verify autonomy ladder persistence and safe mode entry gate blocking."""
     cfg = Settings(
         TRADING_MODE="live",
+        AUTONOMY_START_LEVEL=0,
         BINANCE_API_KEY="valid_key",
         BINANCE_API_SECRET="valid_secret",
         DB_PATH=str(tmp_path / "autonomy.db"),

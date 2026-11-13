@@ -75,7 +75,7 @@ def test_daily_trade_cap_removed_by_default(tmp_path) -> None:
     from engine.risk_engine import RiskEngine
     from tests.test_kelly_and_risk import make_valid_decision
 
-    cfg = Settings(DB_PATH=str(tmp_path / "nocap.db"))
+    cfg = Settings(_env_file=None, DB_PATH=str(tmp_path / "nocap.db"))
     assert cfg.DAILY_MAX_TRADES == 0
     db = DatabaseManager(db_path=cfg.DB_PATH)
     try:
