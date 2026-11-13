@@ -57,15 +57,15 @@ def generate_signal_report(since_str: str = "3d", db_path: str = "") -> str:
     conn, tmp_copy = get_db_connection(db_path)
 
     try:
-        # 1. Overall Signal Outcomes Summary (exclude NOT_FILLED from WinRate & mean R)
+        # 1. Overall Signal Outcomes Summary (exclude NOT_FILLED and MISSED from WinRate & mean R)
         overall = conn.execute(f"""
             SELECT 
                 count(*) as total,
                 sum(CASE WHEN result = 'TP' THEN 1 ELSE 0 END) as tp_count,
                 sum(CASE WHEN result = 'SL' THEN 1 ELSE 0 END) as sl_count,
                 sum(CASE WHEN result = 'TIMEOUT' THEN 1 ELSE 0 END) as timeout_count,
-                avg(CASE WHEN result != 'NOT_FILLED' THEN r_net END) as avg_r_net,
-                avg(CASE WHEN result != 'NOT_FILLED' THEN r_gross END) as avg_r_gross
+                avg(CASE WHEN result NOT IN ('NOT_FILLED', 'MISSED') THEN r_net END) as avg_r_net,
+                avg(CASE WHEN result NOT IN ('NOT_FILLED', 'MISSED') THEN r_gross END) as avg_r_gross
             FROM signal_outcomes
             WHERE resolved_at_ms >= {cutoff_ms}
         """).fetchone()

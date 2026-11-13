@@ -73,6 +73,17 @@ class Settings(BaseSettings):
     PAPER_PARTIAL_FILL_PROB: float = Field(default=0.0, ge=0.0, le=1.0)
     SPOT_FEE_PCT: float = Field(default=0.10, ge=0.0, le=2.0)
     FUTURES_FEE_PCT: float = Field(default=0.05, ge=0.0, le=2.0)
+    FUTURES_FEE_MAKER_PCT: float = Field(default=0.02, ge=0.0, le=1.0)
+    FUTURES_FEE_TAKER_PCT: float = Field(default=0.05, ge=0.0, le=1.0)
+    MAX_COST_R: float = Field(default=0.12, gt=0.0, le=1.0)
+    MIN_STOP_PCT: float = Field(default=0.8, gt=0.0, le=20.0)
+    ENTRY_MAKER_TIMEOUT_BARS: int = Field(default=2, ge=1, le=20)
+    MAX_TRADES_PER_DAY: int = Field(default=6, ge=1, le=100)
+    SYMBOL_SL_COOLDOWN_HOURS: float = Field(default=4.0, ge=0.0, le=72.0)
+    G1_MIN_TRADES: int = Field(default=150, ge=10)
+    G1_LCB_MIN_R: float = Field(default=-0.05)
+    RESEARCH_MAX_CONFIGS_PER_STRATEGY: int = Field(default=12, ge=1, le=50)
+    RESEARCH_DATA_DIR: str = Field(default="research_data")
 
     # === T1: UNPROTECTED-EXPOSURE GUARANTEES ===
     ENTRY_ORDER_TTL_SEC: float = Field(default=90.0, ge=0.0, le=900.0)

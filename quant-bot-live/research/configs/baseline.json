@@ -1,0 +1,13 @@
+{
+  "strategy_id": "baseline_legacy",
+  "max_configs": 12,
+  "configs": [
+    {
+      "name": "legacy_default",
+      "rsi_entry": 32.0,
+      "atr_stop_mult": 1.5,
+      "tp_r_mult": 2.5,
+      "entry_type": "MAKER"
+    }
+  ]
+}
