@@ -147,11 +147,11 @@ class RiskEngine:
                 "reason": f"Symbol {decision.symbol} is temporarily paused.",
             }
 
-        # Daily Trade Cap
+        # Daily Trade Cap (0 = unlimited / continuous trading)
         if hasattr(self.db, "get_daily_trades_count"):
             daily_trades = self.db.get_daily_trades_count()
-            max_daily_trades = int(getattr(self.cfg, "DAILY_MAX_TRADES", 6))
-            if daily_trades >= max_daily_trades:
+            max_daily_trades = int(getattr(self.cfg, "DAILY_MAX_TRADES", 0))
+            if max_daily_trades > 0 and daily_trades >= max_daily_trades:
                 return {
                     "approved": False,
                     "position_usd": 0.0,

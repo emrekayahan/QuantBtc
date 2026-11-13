@@ -317,7 +317,8 @@ class TelegramNotifier:
             dd = float(state.get("current_drawdown_pct", "0.0") or 0.0)
             min_conf = float(state.get("min_confidence_threshold", str(self.cfg.MIN_CONFIDENCE_THRESHOLD)) or 0.68)
             daily_trades = self.db.get_daily_trades_count() if hasattr(self.db, "get_daily_trades_count") else 0
-            max_daily_trades = int(getattr(self.cfg, "DAILY_MAX_TRADES", 20))
+            max_daily_trades = int(getattr(self.cfg, "DAILY_MAX_TRADES", 0))
+            quota_text = f"{daily_trades} / Sınırsız" if max_daily_trades <= 0 else f"{daily_trades} / {max_daily_trades}"
             open_pos = self.db.get_open_positions() if hasattr(self.db, "get_open_positions") else []
             regime = _clean_md(state.get("macro_regime", "Bilinmiyor").upper())
             commentary = _clean_md(state.get("macro_commentary", "Veri yok"))[:240]
@@ -348,7 +349,7 @@ class TelegramNotifier:
                 f"  📊 *Toplam Kasa (Net Equity):* `${eq:,.2f}`\n\n"
                 f"📈 *İŞLEM & PERFORMANS:*\n"
                 f"• *Açık Pozisyon:* `{len(open_pos)} Adet`\n"
-                f"• *Günlük İşlem Kotası:* `{daily_trades} / {max_daily_trades}`\n"
+                f"• *Günlük İşlem Kotası:* `{quota_text}`\n"
                 f"• *Min Güven Eşiği:* `%{min_conf * 100:.0f}`\n"
                 f"• *Günlük K/Z:* `${pnl:+,.2f}`\n"
                 f"• *Drawdown:* `%{dd:.2f}`\n"
