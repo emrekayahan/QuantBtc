@@ -75,6 +75,8 @@ async def test_partial_fill_protects_filled_amount_and_cancels_remaining(tmp_pat
     """Verify that when an entry order partially fills, SL is placed immediately for the filled amount."""
     live_cfg = Settings(
         TRADING_MODE="live",
+        FUTURES_ONLY_MODE=False,
+        ALLOW_SPOT_FALLBACK=True,
         ENTRY_ORDER_TTL_SEC=0.1,
         ENTRY_ORDER_POLL_SEC=0.05,
         BINANCE_API_KEY="dummy_key",

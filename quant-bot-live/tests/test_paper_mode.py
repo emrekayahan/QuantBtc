@@ -18,6 +18,8 @@ async def test_paper_mode_does_not_call_exchange(tmp_path) -> None:
     """Verify that in paper mode, ExecutionEngine simulates execution without calling CCXT create_order."""
     paper_settings = Settings(
         TRADING_MODE="paper",
+        FUTURES_ONLY_MODE=False,
+        ALLOW_SPOT_FALLBACK=True,
         BINANCE_API_KEY="dummy_key",
         BINANCE_API_SECRET="dummy_secret",
         DB_PATH=str(tmp_path / "paper_test.db"),
@@ -65,6 +67,8 @@ async def test_live_mode_calls_exchange(tmp_path) -> None:
     """Verify that in live mode, ExecutionEngine places real orders via exchange client."""
     live_settings = Settings(
         TRADING_MODE="live",
+        FUTURES_ONLY_MODE=False,
+        ALLOW_SPOT_FALLBACK=True,
         BINANCE_API_KEY="dummy_key",
         BINANCE_API_SECRET="dummy_secret",
         DB_PATH=str(tmp_path / "live_test.db"),

@@ -43,15 +43,12 @@ class MarketRouter:
     ) -> Dict[str, Any]:
         side = getattr(decision, "direction", getattr(decision, "side", "long"))
         is_short = str(side).lower() == "short"
-        enable_futures = bool(getattr(self.cfg, "ENABLE_FUTURES", False))
+        enable_futures = bool(getattr(self.cfg, "ENABLE_FUTURES", True))
+        futures_only = bool(getattr(self.cfg, "FUTURES_ONLY_MODE", True))
+        allow_spot_fallback = bool(getattr(self.cfg, "ALLOW_SPOT_FALLBACK", False))
+        enable_short = bool(getattr(self.cfg, "ENABLE_SHORT", True))
 
-        # Check autonomy level against FUTURES_MIN_LEVEL
-        autonomy_level = int(self.db.get_state("autonomy_level", "0") or 0)
-        futures_min_level = int(getattr(self.cfg, "FUTURES_MIN_LEVEL", 1))
-        if autonomy_level < futures_min_level:
-            enable_futures = False
-
-        # Rule 1: Shorting is ONLY supported on Futures
+        # Rule 1: Shorting requires ENABLE_FUTURES and ENABLE_SHORT
         if is_short and not enable_futures:
             return {
                 "approved": False,
@@ -61,6 +58,15 @@ class MarketRouter:
                 "margin_usd": 0.0,
                 "router_reason": "Short signals not allowed when ENABLE_FUTURES is false (no spot shorting).",
             }
+        if is_short and not enable_short:
+            return {
+                "approved": False,
+                "market_type": "NONE",
+                "leverage": 1,
+                "position_usd": 0.0,
+                "margin_usd": 0.0,
+                "router_reason": "Short signals disabled (ENABLE_SHORT=false).",
+            }
 
         # Check funding threshold on futures
         max_funding = float(getattr(self.cfg, "MAX_FUNDING_PCT", 0.05))
@@ -68,7 +74,7 @@ class MarketRouter:
 
         # Sizing evaluations
         spot_res = None
-        if not is_short:
+        if not is_short and (not futures_only or allow_spot_fallback):
             spot_res = self.risk_engine.compute_position_size_usd(
                 decision=decision,
                 free_usdt=spot_free_usdt,

@@ -1028,6 +1028,8 @@ async def test_r15_market_router_picks_spot_when_futures_not_better(tmp_path) ->
     from tests.test_kelly_and_risk import make_valid_decision
     cfg = Settings(
         ENABLE_FUTURES=True,
+        FUTURES_ONLY_MODE=False,
+        ALLOW_SPOT_FALLBACK=True,
         SPOT_FEE_PCT=0.10,
         FUTURES_FEE_PCT=0.05,
         DB_PATH=str(tmp_path / "router.db"),

@@ -143,6 +143,8 @@ async def test_idempotent_timeout_recovery_and_server_side_sl_placement(tmp_path
     """
     live_cfg = Settings(
         TRADING_MODE="live",
+        FUTURES_ONLY_MODE=False,
+        ALLOW_SPOT_FALLBACK=True,
         BINANCE_API_KEY="dummy_key",
         BINANCE_API_SECRET="dummy_secret",
         DB_PATH=str(tmp_path / "idem_test.db"),
@@ -179,6 +181,8 @@ async def test_sl_failure_after_3_retries_triggers_immediate_market_sell_and_4h_
     """
     live_cfg = Settings(
         TRADING_MODE="live",
+        FUTURES_ONLY_MODE=False,
+        ALLOW_SPOT_FALLBACK=True,
         BINANCE_API_KEY="dummy_key",
         BINANCE_API_SECRET="dummy_secret",
         DB_PATH=str(tmp_path / "sl_fail_test.db"),

@@ -902,7 +902,7 @@ async def test_trade_features_written_on_open_paper_and_live(tmp_path) -> None:
     from engine.schemas import ReflexDecisionSchema
     from tests.test_idempotency import StubCCXTClient
 
-    cfg = Settings(TRADING_MODE="paper", DB_PATH=str(tmp_path / "features.db"))
+    cfg = Settings(TRADING_MODE="paper", FUTURES_ONLY_MODE=False, ALLOW_SPOT_FALLBACK=True, DB_PATH=str(tmp_path / "features.db"))
     db = DatabaseManager(db_path=cfg.DB_PATH)
     # Record a snapshot so trade_features has source data
     now_ms = int(time.time() * 1000)

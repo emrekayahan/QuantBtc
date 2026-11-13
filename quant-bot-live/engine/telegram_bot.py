@@ -254,6 +254,7 @@ class TelegramNotifier:
             hb_ts = float(state.get("last_heartbeat_ts", "0") or 0)
             hb_age = f"{int(time.time() - hb_ts)}s" if hb_ts > 0 else "N/A"
             open_pos = len(self.db.get_open_positions(include_unprotected=True))
+            split_warn = state.get("wallet_split_warning", "false")
             msg = (
                 "🩺 *Sistem Sağlığı (/saglik)*\n"
                 f"• Safe Mode: `{'ON' if safe_mode else 'OFF'}`\n"
@@ -261,7 +262,8 @@ class TelegramNotifier:
                 f"• Clock Drift: `{drift_ms} ms`\n"
                 f"• Heartbeat Yaşı: `{hb_age}`\n"
                 f"• Resolver Hataları: `{resolver_errs}`\n"
-                f"• Açık Pozisyon: `{open_pos}`"
+                f"• Açık Pozisyon: `{open_pos}`\n"
+                f"• Sermaye Bölünmüş Uyarısı: `{split_warn}`"
             )
             await self.send_message(msg)
 
