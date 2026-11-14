@@ -157,7 +157,7 @@ class Settings(BaseSettings):
     DASHBOARD_PORT: int = Field(default=8000, ge=1024, le=65535)
     DB_PATH: str = Field(default="")
     LOG_DIR: str = Field(default=str(BASE_DIR / "logs"))
-    TOP_WATCHLIST_SIZE: int = Field(default=20, ge=5, le=50)
+    TOP_WATCHLIST_SIZE: int = Field(default=50, ge=0, le=200)
 
     @property
     def effective_db_path(self) -> str:

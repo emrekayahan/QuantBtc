@@ -354,7 +354,8 @@ class AutonomousMarketScanner:
             )
 
         candidates.sort(key=lambda x: x["_score"], reverse=True)
-        top_n = candidates[: int(self.cfg.TOP_WATCHLIST_SIZE)]
+        limit = int(self.cfg.TOP_WATCHLIST_SIZE)
+        top_n = candidates if limit <= 0 else candidates[:limit]
         for idx, item in enumerate(top_n, start=1):
             item["rank"] = idx
             item.pop("_score", None)

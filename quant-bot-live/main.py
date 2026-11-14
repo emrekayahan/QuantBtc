@@ -266,7 +266,10 @@ class AutonomousQuantEngineOrchestrator:
 
                 if (
                     is_new_closed_candle
-                    and decision.direction == "long"
+                    and (
+                        decision.direction == "long"
+                        or (decision.direction == "short" and getattr(settings, "ENABLE_SHORT", True))
+                    )
                     and decision.setup_quality >= settings.MIN_SETUP_QUALITY
                     and decision.direction_confidence >= self.risk_engine.get_active_min_confidence()
                     and self.cfg_has_keys()
